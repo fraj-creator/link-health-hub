@@ -110,7 +110,11 @@ def slack_notify(text: str) -> None:
     if not SLACK_WEBHOOK_URL:
         return
     try:
-        requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=TIMEOUT)
+        requests.post(
+            SLACK_WEBHOOK_URL,
+            json={"text": text, "mrkdwn": True},
+            timeout=TIMEOUT,
+        )
     except requests.RequestException:
         pass
 
@@ -182,12 +186,20 @@ def main():
     print(f"Done. Checked={checked}, Status updated={updated}")
 
     if newly_broken:
-        lines = [f"⚠️ Link Health Hub: {len(newly_broken)} newly broken link(s):"]
+        n = len(newly_broken)
+        noun = "link" if n == 1 else "links"
+
+        lines = [f"⚠️ Link Health Hub: {n} newly broken {noun}:"]
+
         for pg, t, u, c in newly_broken[:20]:
             code_str = f" ({int(c)})" if c is not None else ""
-            lines.append(f"• [{pg}] {t}{code_str} — {u}")
-        if len(newly_broken) > 20:
-            lines.append(f"…and {len(newly_broken) - 20} more.")
+            pg_bold = f"*{pg}*"
+            link_text = f"<{u}|Link>"
+            lines.append(f"• {pg_bold} {t}{code_str} — {link_text}")
+
+        if n > 20:
+            lines.append(f"…and {n - 20} more.")
+
         slack_notify("\n".join(lines))
 
 if __name__ == "__main__":
