@@ -1,11 +1,16 @@
 import os
 import time
 from datetime import datetime, timezone
+
 import requests
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")  # optional
+
+# Slack webhooks
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")            # prod channel
+SLACK_TEST_WEBHOOK_URL = os.environ.get("SLACK_TEST_WEBHOOK_URL")  # personal/test
+SLACK_MODE = os.environ.get("SLACK_MODE", "prod").lower()          # prod | test
 
 NOTION_VERSION = "2022-06-28"
 TIMEOUT = 12
@@ -18,41 +23,57 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
+
 def notion_query_database(database_id: str, start_cursor: str | None = None) -> dict:
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    payload = {}
+    payload: dict = {}
     if start_cursor:
         payload["start_cursor"] = start_cursor
     r = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=TIMEOUT)
+    if not r.ok:
+        # Helpful debug output in GitHub Actions logs (does not print secrets)
+        print("Notion error:", r.status_code, r.text)
     r.raise_for_status()
     return r.json()
+
 
 def notion_update_page(page_id: str, properties: dict) -> None:
     url = f"https://api.notion.com/v1/pages/{page_id}"
     payload = {"properties": properties}
     r = requests.patch(url, headers=NOTION_HEADERS, json=payload, timeout=TIMEOUT)
+    if not r.ok:
+        print("Notion update error:", r.status_code, r.text)
     r.raise_for_status()
+
 
 def get_prop(props: dict, name: str) -> dict:
     return props.get(name, {})
 
+
 def get_title(props: dict) -> str:
     t = get_prop(props, "Title")
     title_arr = t.get("title", [])
-    if title_arr and "plain_text" in title_arr[0]:
-        return "".join([x.get("plain_text", "") for x in title_arr]).strip()
+    if title_arr:
+        return "".join([x.get("plain_text", "") for x in title_arr]).strip() or "(untitled)"
     return "(untitled)"
+
 
 def get_url(props: dict) -> str | None:
     u = get_prop(props, "Primary URL")
     return u.get("url")
+
 
 def get_status(props: dict) -> str | None:
     s = get_prop(props, "Status")
     sel = s.get("select")
     return sel.get("name") if sel else None
 
+
 def get_pages(props: dict) -> str:
+    """
+    Reads the Notion property named "Pages".
+    Supports Select or Multi-select. Returns a readable label.
+    """
     p = get_prop(props, "Pages")
 
     # Select
@@ -75,23 +96,38 @@ def get_pages(props: dict) -> str:
 
     return ""
 
+
 # ---- Link checking ----
 def check_url(url: str) -> tuple[int | None, str | None]:
     if not url or not isinstance(url, str):
         return None, "empty_url"
     url = url.strip()
+
     try:
-        r = requests.head(url, allow_redirects=True, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+        r = requests.head(
+            url,
+            allow_redirects=True,
+            timeout=TIMEOUT,
+            headers={"User-Agent": USER_AGENT},
+        )
         code = r.status_code
 
         # fallback if HEAD is blocked/unreliable
         if code in (403, 405) or code >= 500:
-            r = requests.get(url, allow_redirects=True, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, stream=True)
+            r = requests.get(
+                url,
+                allow_redirects=True,
+                timeout=TIMEOUT,
+                headers={"User-Agent": USER_AGENT},
+                stream=True,
+            )
             code = r.status_code
 
         return code, None
+
     except requests.RequestException as e:
         return None, type(e).__name__
+
 
 def status_from_code(code: int | None) -> str:
     if code is None:
@@ -105,24 +141,33 @@ def status_from_code(code: int | None) -> str:
         return "Active"
     return "Broken"
 
+
 # ---- Slack notify (optional) ----
 def slack_notify(text: str) -> None:
-    if not SLACK_WEBHOOK_URL:
+    webhook = None
+    if SLACK_MODE == "test":
+        webhook = SLACK_TEST_WEBHOOK_URL
+    else:
+        webhook = SLACK_WEBHOOK_URL
+
+    if not webhook:
         return
+
     try:
         requests.post(
-            SLACK_WEBHOOK_URL,
+            webhook,
             json={"text": text, "mrkdwn": True},
             timeout=TIMEOUT,
         )
     except requests.RequestException:
         pass
 
+
 def main():
     start_cursor = None
     checked = 0
     updated = 0
-    newly_broken = []
+    newly_broken: list[tuple[str, str, str, int | None]] = []
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -148,15 +193,14 @@ def main():
             new_status = status_from_code(code)
 
             checked += 1
-
-            props_to_update = {}
+            props_to_update: dict = {}
 
             # Update Status only if changed
             if new_status != current_status:
                 props_to_update["Status"] = {"select": {"name": new_status}}
                 updated += 1
 
-                # Track only "newly broken" (Active -> Broken or None -> Broken)
+                # Track only "newly broken" (not already Broken)
                 if new_status == "Broken" and current_status != "Broken":
                     newly_broken.append((page_label, title, url, code))
 
@@ -165,17 +209,17 @@ def main():
                 props_to_update["Last Checked"] = {"date": {"start": now_iso}}
 
             if "HTTP Code" in props:
-                # HTTP Code should be a "Number" property in Notion
+                # "HTTP Code" should be a Number property in Notion
                 props_to_update["HTTP Code"] = {"number": float(code) if code is not None else None}
 
             if "Check Error" in props:
-                # Check Error could be a "Rich text" property
+                # "Check Error" can be a Rich text property
                 props_to_update["Check Error"] = {"rich_text": [{"text": {"content": err or ""}}]}
 
             if props_to_update:
                 notion_update_page(page_id, props_to_update)
 
-            # small sleep to be gentle with rate limits
+            # gentle rate limiting for Notion + remote sites
             time.sleep(0.35)
 
         if data.get("has_more"):
@@ -185,6 +229,10 @@ def main():
 
     print(f"Done. Checked={checked}, Status updated={updated}")
 
+    # Slack message formatting rules requested:
+    # - "link" vs "links"
+    # - Pages in bold
+    # - URL hidden behind "Link"
     if newly_broken:
         n = len(newly_broken)
         noun = "link" if n == 1 else "links"
@@ -201,6 +249,7 @@ def main():
             lines.append(f"…and {n - 20} more.")
 
         slack_notify("\n".join(lines))
+
 
 if __name__ == "__main__":
     main()
