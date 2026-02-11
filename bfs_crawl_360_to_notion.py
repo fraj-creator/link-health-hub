@@ -537,15 +537,49 @@ def build_db_b_index(db_b_schema: dict) -> Dict[str, dict]:
 # HTTP checks
 # -------------------------
 def check_url(url: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    GET-first 'light' check:
+    - usa GET (più compatibile di HEAD)
+    - non scarica il body (stream=True) e chiude subito
+    - fallback HEAD solo se GET fallisce per motivi strani
+    """
     try:
-        r = SESSION.head(url, allow_redirects=True, timeout=TIMEOUT)
+        r = SESSION.get(
+            url,
+            allow_redirects=True,
+            timeout=TIMEOUT,
+            stream=True,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
+        )
         code = r.status_code
-        if code in (403, 405) or code >= 500:
-            r = SESSION.get(url, allow_redirects=True, timeout=TIMEOUT, stream=True)
-            code = r.status_code
+        # IMPORTANT: non scaricare contenuto
+        r.close()
         return code, None
-    except requests.RequestException as e:
-        return None, type(e).__name__
+
+    except requests.RequestException as e_get:
+        # fallback HEAD (a volte passa dove GET fallisce)
+        try:
+            r = SESSION.head(
+                url,
+                allow_redirects=True,
+                timeout=TIMEOUT,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+            code = r.status_code
+            r.close()
+            return code, type(e_get).__name__
+        except requests.RequestException as e_head:
+            return None, type(e_head).__name__
 
 def classify(code: Optional[int]) -> str:
     if code is None:
