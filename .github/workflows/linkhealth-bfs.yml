@@ -1,0 +1,41 @@
+name: LinkHealth BFS (120 test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: "Max pages to crawl"
+        required: true
+        default: "120"
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
+
+      - name: Run BFS crawl
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_A_ID: ${{ secrets.NOTION_DB_A_ID }}
+          NOTION_DB_B_ID: ${{ secrets.NOTION_DB_B_ID }}
+          SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_MODE: "prod"
+          MAX_PAGES: ${{ inputs.max_pages }}
+          CHECK_EXTERNAL: "true"
+          CHECK_INTERNAL: "true"
+          CRAWL_SLEEP: "0.3"
+          NOTION_SLEEP: "0.25"
+          SKIP_DOMAINS: "linkedin.com"
+        run: |
+          python bfs_crawl_360_to_notion.py
