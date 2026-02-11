@@ -52,6 +52,29 @@ def get_status(props: dict) -> str | None:
     sel = s.get("select")
     return sel.get("name") if sel else None
 
+def get_pages(props: dict) -> str:
+    p = get_prop(props, "Pages")
+
+    # Select
+    if p.get("type") == "select" and p.get("select"):
+        return p["select"].get("name", "")
+
+    # Multi-select
+    if p.get("type") == "multi_select":
+        items = p.get("multi_select", [])
+        names = [x.get("name", "") for x in items if x.get("name")]
+        return ", ".join(names)
+
+    # Fallbacks
+    if "select" in p and p.get("select"):
+        return p["select"].get("name", "")
+    if "multi_select" in p:
+        items = p.get("multi_select", [])
+        names = [x.get("name", "") for x in items if x.get("name")]
+        return ", ".join(names)
+
+    return ""
+
 # ---- Link checking ----
 def check_url(url: str) -> tuple[int | None, str | None]:
     if not url or not isinstance(url, str):
@@ -115,6 +138,7 @@ def main():
                 continue
 
             title = get_title(props)
+            page_label = get_pages(props) or "Unknown"
 
             code, err = check_url(url)
             new_status = status_from_code(code)
@@ -130,7 +154,7 @@ def main():
 
                 # Track only "newly broken" (Active -> Broken or None -> Broken)
                 if new_status == "Broken" and current_status != "Broken":
-                    newly_broken.append((title, url, code))
+                    newly_broken.append((page_label, title, url, code))
 
             # Optional columns (update only if they exist in DB)
             if "Last Checked" in props:
@@ -159,9 +183,9 @@ def main():
 
     if newly_broken:
         lines = [f"⚠️ Link Health Hub: {len(newly_broken)} newly broken link(s):"]
-        for t, u, c in newly_broken[:20]:
+        for pg, t, u, c in newly_broken[:20]:
             code_str = f" ({int(c)})" if c is not None else ""
-            lines.append(f"• {t}{code_str} — {u}")
+            lines.append(f"• [{pg}] {t}{code_str} — {u}")
         if len(newly_broken) > 20:
             lines.append(f"…and {len(newly_broken) - 20} more.")
         slack_notify("\n".join(lines))
