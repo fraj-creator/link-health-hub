@@ -540,25 +540,47 @@ def check_url(url: str) -> Tuple[Optional[int], Optional[str]]:
     """
     GET-first 'light' check:
     - usa GET (più compatibile di HEAD)
-    - non scarica il body (stream=True) e chiude subito
+    - di default non scarica il body (stream=True) e chiude subito
+    - per i domini Notion legge qualche KB per capire se la pagina è davvero mancante
     - fallback HEAD solo se GET fallisce per motivi strani
     """
+    netloc = ""
+    try:
+        netloc = urlparse(url).netloc.lower()
+    except Exception:
+        pass
+
+    want_body = netloc.endswith("notion.site") or netloc.endswith("notion.so")
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
     try:
         r = SESSION.get(
             url,
             allow_redirects=True,
             timeout=TIMEOUT,
-            stream=True,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            },
+            stream=not want_body,
+            headers=headers,
         )
         code = r.status_code
-        # IMPORTANT: non scaricare contenuto
+
+        if want_body:
+            # Leggi solo i primi KB per capire se Notion risponde "Couldn't find the page"
+            text = ""
+            try:
+                text = r.text[:4000].lower()
+            except Exception:
+                text = ""
+            if "couldn't find the page" in text or "couldnt find the page" in text:
+                r.close()
+                return 404, "notion_page_not_found"
+
         r.close()
         return code, None
 
