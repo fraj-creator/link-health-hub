@@ -10,9 +10,11 @@ Updates:
 """
 
 import os
+import socket
 import time
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Set
+from urllib.parse import urlparse
 
 import requests
 
@@ -46,6 +48,33 @@ HEADERS = {
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
 
+# Domains that often return anti-bot codes (403/999) even if the page is alive.
+# You can override the list with env BLOCKED_AS_ACTIVE_DOMAINS (comma-separated).
+DEFAULT_WHITELIST = [
+    "linkedin.com",
+    "substack.com",
+    "economist.com",
+    "annualreviews.org",
+    "iea.org",
+    "ncbi.nlm.nih.gov",
+    "axios.com",
+    "techfundingnews.com",
+    "lesechos.fr",
+]
+
+WHITELIST: Set[str] = {
+    d.strip().lower()
+    for d in os.environ.get("BLOCKED_AS_ACTIVE_DOMAINS", ",".join(DEFAULT_WHITELIST)).split(",")
+    if d.strip()
+}
+
+# HTTP codes that, when combined with a whitelisted domain, should be treated as Active
+WHITELIST_ACTIVE_CODES: Set[int] = {
+    int(x)
+    for x in os.environ.get("ACTIVE_WHEN_BLOCKED_CODES", "403,999").split(",")
+    if x.strip().isdigit()
+}
+
 
 # -------------------------
 # Helpers
@@ -54,30 +83,107 @@ def iso_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def classify(code: Optional[int]) -> str:
+def is_whitelisted(url: str) -> bool:
+    try:
+        netloc = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    for d in WHITELIST:
+        if netloc == d or netloc.endswith("." + d):
+            return True
+    return False
+
+
+def classify(url: str, code: Optional[int]) -> str:
+    """Return Active/Broken/Blocked.
+
+    - 2xx/3xx => Active
+    - 403/999 on a whitelisted domain => Active (they're usually anti-bot)
+    - 404/410 => Broken
+    - 401/403/429/999 => Blocked (non‑whitelisted)
+    - everything else => Broken
+    """
+
     if code is None:
         return "Broken"
+
     if 200 <= code < 400:
         return "Active"
+
+    if code in WHITELIST_ACTIVE_CODES and is_whitelisted(url):
+        return "Active"
+
     if code in (404, 410):
         return "Broken"
+
     if code in (401, 403, 429, 999):
         return "Blocked"
+
     if 400 <= code < 500:
         return "Broken"
+
     if code >= 500:
         return "Broken"
+
     return "Broken"
 
 
 def check_url(url: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Preflight (DNS + TCP) -> HEAD -> fallback GET (stream).
+    Returns (status_code | None, error_label | None)
+    """
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    # ----- Step 0: DNS + TCP handshake (non-intrusivo, niente HTTP ancora)
     try:
-        r = SESSION.get(url, timeout=TIMEOUT, allow_redirects=True)
+        parsed = urlparse(url)
+        host = parsed.hostname
+        scheme = (parsed.scheme or "https").lower()
+        port = parsed.port or (443 if scheme == "https" else 80)
+        if not host:
+            return None, "no_host"
+
+        # DNS
+        socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+
+        # TCP connect
+        with socket.create_connection((host, port), timeout=6):
+            pass
+    except socket.gaierror:
+        return None, "dns_error"
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return None, "tcp_connect_error"
+    except Exception as e:
+        return None, type(e).__name__
+
+    # ----- Step 1: HEAD (leggerissimo)
+    try:
+        r = SESSION.head(url, timeout=TIMEOUT, allow_redirects=True, headers=headers)
+        code = r.status_code
+        r.close()
+        # Alcuni siti bloccano HEAD (403/405); in quel caso proviamo GET
+        if code not in (403, 405):
+            return code, None
+    except requests.RequestException as e_head:
+        head_err = type(e_head).__name__
+    else:
+        head_err = None
+
+    # ----- Step 2: GET con stream (solo header + chiusura rapida)
+    try:
+        r = SESSION.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True, headers=headers)
         code = r.status_code
         r.close()
         return code, None
-    except requests.RequestException as e:
-        return None, type(e).__name__
+    except requests.RequestException as e_get:
+        return None, head_err or type(e_get).__name__
 
 
 # -------------------------
@@ -151,14 +257,14 @@ def main():
         print("Rechecking:", link_url)
 
         code, err = check_url(link_url)
-        result = classify(code)
+        result = classify(link_url, code)
 
         print("→ HTTP:", code, "| New Result:", result)
 
         update_payload = {
             "properties": {
                 "Result": {"select": {"name": result}},
-                "HTTP Code": {"number": code} if code else {"number": None},
+                "HTTP Code": {"number": code} if code is not None else {"number": None},
                 "Error": {
                     "rich_text": [
                         {"text": {"content": err or ""}}
