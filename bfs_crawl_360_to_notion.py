@@ -551,6 +551,14 @@ def check_url(url: str) -> Tuple[Optional[int], Optional[str]]:
         pass
 
     want_body = netloc.endswith("notion.site") or netloc.endswith("notion.so")
+    notion_block_id = None
+    if want_body:
+        # estrai il page id (32 hex) anche se con trattini/slug
+        clean = re.sub(r"[^0-9a-fA-F]", "", url)
+        m = re.search(r"([0-9a-fA-F]{32})", clean)
+        if m:
+            raw = m.group(1)
+            notion_block_id = f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
 
     headers = {
         "User-Agent": USER_AGENT,
@@ -559,6 +567,22 @@ def check_url(url: str) -> Tuple[Optional[int], Optional[str]]:
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
+
+    # Notion: prova prima l'API pubblica per capire se la pagina è privata (login richiesto)
+    if notion_block_id:
+        try:
+            api_resp = SESSION.post(
+                "https://www.notion.so/api/v3/getPublicPageData",
+                json={"blockId": notion_block_id},
+                headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
+                timeout=TIMEOUT,
+            )
+            if api_resp.ok:
+                role = (api_resp.json() or {}).get("publicAccessRole")
+                if role in (None, "", "none"):
+                    return 401, "notion_private_or_login_required"
+        except Exception:
+            pass
 
     try:
         r = SESSION.get(
