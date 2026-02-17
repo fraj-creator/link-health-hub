@@ -208,7 +208,11 @@ def notion_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 def notion_patch(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     _notion_rate_limit_sleep()
     r = SESSION.patch(f"{NOTION_API}{path}", headers=_notion_headers(), json=payload, timeout=TIMEOUT)
-    r.raise_for_status()
+
+    if not r.ok:
+        print("NOTION PATCH ERROR:", r.status_code, r.text, flush=True)
+        r.raise_for_status()
+
     return r.json()
 
 
