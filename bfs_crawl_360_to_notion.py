@@ -270,7 +270,8 @@ def set_title(v: str) -> Dict[str, Any]:
 
 
 def set_url(v: str) -> Dict[str, Any]:
-    return {"url": v or ""}
+    v = (v or "").strip()
+    return {"url": v if v else None}
 
 
 def set_select(v: str) -> Dict[str, Any]:
@@ -402,6 +403,8 @@ def upsert_db_b(
     now_prop = set_date_now()
     title_val = f"{link_type_val}: {url_key}"
     key = sha1("|".join([source_page_id, url_key, anchor_text, dom_area, locator_css]))
+    
+deep_link = (deep_link or "").strip() or None
 
     props_payload = {
         db_b_title_prop: set_title(title_val),
