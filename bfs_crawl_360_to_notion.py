@@ -534,100 +534,127 @@ def build_db_b_index(db_b_schema: dict) -> Dict[str, dict]:
 
 
 # -------------------------
-# HTTP checks
+# HTTP checks (robusti, NO parsing HTML)
 # -------------------------
-def check_url(url: str) -> Tuple[Optional[int], Optional[str]]:
-    """
-    GET-first 'light' check:
-    - usa GET (più compatibile di HEAD)
-    - di default non scarica il body (stream=True) e chiude subito
-    - per i domini Notion legge qualche KB per capire se la pagina è davvero mancante
-    - fallback HEAD solo se GET fallisce per motivi strani
-    """
-    netloc = ""
+
+def _is_notion(url: str) -> bool:
     try:
         netloc = urlparse(url).netloc.lower()
+        return netloc.endswith("notion.site") or netloc.endswith("notion.so") or netloc in ("www.notion.so", "notion.so")
     except Exception:
-        pass
+        return False
 
-    want_body = netloc.endswith("notion.site") or netloc.endswith("notion.so")
-    notion_block_id = None
-    if want_body:
-        # estrai il page id (32 hex) anche se con trattini/slug
+
+def _extract_notion_block_id(url: str) -> Optional[str]:
+    """Estrae un page/block id Notion (32 hex) dall'URL e lo normalizza in UUID 8-4-4-4-12."""
+    try:
         clean = re.sub(r"[^0-9a-fA-F]", "", url)
         m = re.search(r"([0-9a-fA-F]{32})", clean)
-        if m:
-            raw = m.group(1)
-            notion_block_id = f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+        if not m:
+            return None
+        raw = m.group(1).lower()
+        return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+    except Exception:
+        return None
 
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
 
-    # Notion: prova prima l'API pubblica per capire se la pagina è privata (login richiesto)
-    if notion_block_id:
-        try:
-            api_resp = SESSION.post(
-                "https://www.notion.so/api/v3/getPublicPageData",
-                json={"blockId": notion_block_id},
-                headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
-                timeout=TIMEOUT,
-            )
-            if api_resp.ok:
-                role = (api_resp.json() or {}).get("publicAccessRole")
-                if role in (None, "", "none"):
-                    return 401, "notion_private_or_login_required"
-        except Exception:
-            pass
+def _probe_head(url: str, timeout: int = TIMEOUT) -> Tuple[Optional[int], Optional[str]]:
+    """HEAD con redirect. Non legge body."""
+    try:
+        r = SESSION.head(
+            url,
+            allow_redirects=True,
+            timeout=timeout,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
+        )
+        code = r.status_code
+        r.close()
+        return code, None
+    except requests.RequestException as e:
+        return None, type(e).__name__
 
+
+def _probe_get_headers_only(url: str, timeout: int = TIMEOUT, user_agent: Optional[str] = None) -> Tuple[Optional[int], Optional[str]]:
+    """GET con stream=True ma chiude subito: ottieni status + headers, senza leggere HTML."""
     try:
         r = SESSION.get(
             url,
             allow_redirects=True,
-            timeout=TIMEOUT,
-            stream=not want_body,
-            headers=headers,
+            timeout=timeout,
+            stream=True,
+            headers={
+                "User-Agent": user_agent or USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
         )
         code = r.status_code
-
-        if want_body:
-            # Leggi solo i primi KB per capire se Notion risponde "Couldn't find the page"
-            text = ""
-            try:
-                text = r.text[:4000].lower()
-            except Exception:
-                text = ""
-            if "couldn't find the page" in text or "couldnt find the page" in text:
-                r.close()
-                return 404, "notion_page_not_found"
-
         r.close()
         return code, None
+    except requests.RequestException as e:
+        return None, type(e).__name__
 
-    except requests.RequestException as e_get:
-        # fallback HEAD (a volte passa dove GET fallisce)
+
+def _notion_oracle(block_id: str, timeout: int = TIMEOUT) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Terzo check "forte" per Notion (senza HTML): usa getPublicPageData.
+    Ritorna (verdict, reason):
+      - ("public",  None)  -> pagina pubblica/accessibile
+      - ("private", reason)-> esiste ma non accessibile pubblicamente
+      - ("missing", reason)-> non trovata / rimossa
+      - (None,     reason)-> inconclusivo (timeout/rate limit/risposta strana)
+    """
+    try:
+        resp = SESSION.post(
+            "https://www.notion.so/api/v3/getPublicPageData",
+            json={"blockId": block_id},
+            headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
+            timeout=timeout,
+        )
+
         try:
-            r = SESSION.head(
-                url,
-                allow_redirects=True,
-                timeout=TIMEOUT,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            )
-            code = r.status_code
-            r.close()
-            return code, type(e_get).__name__
-        except requests.RequestException as e_head:
-            return None, type(e_head).__name__
+            data = resp.json() if resp.content else {}
+        except Exception:
+            data = {}
+
+        if resp.ok:
+            role = (data or {}).get("publicAccessRole")
+            if role in (None, "", "none"):
+                return "private", "notion_publicAccessRole_none"
+            return "public", None
+
+        sc = resp.status_code
+        payload = ""
+        try:
+            payload = str(data).lower()
+        except Exception:
+            payload = ""
+
+        if sc in (401, 403) or "unauthorized" in payload or "not authorized" in payload or "permission" in payload:
+            return "private", f"notion_api_{sc}_unauthorized"
+
+        if sc in (404, 410) or "not found" in payload or "does not exist" in payload:
+            return "missing", f"notion_api_{sc}_not_found"
+
+        if sc in (429, 503):
+            return None, f"notion_api_{sc}_rate_or_temp"
+
+        return None, f"notion_api_{sc}_unknown"
+
+    except requests.RequestException as e:
+        return None, type(e).__name__
+
 
 def classify(code: Optional[int]) -> str:
+    """Mappa HTTP code -> Result."""
     if code is None:
         return "Broken"
     if 200 <= code < 400:
@@ -642,26 +669,100 @@ def classify(code: Optional[int]) -> str:
         return "Broken"
     return "Broken"
 
+
+def check_url(url: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Logica forte, NO parsing HTML:
+    - Check 1: HEAD
+    - Check 2: GET headers-only
+    - Check 3 (solo Notion): getPublicPageData (oracle)
+      Active su Notion SOLO se oracle conferma "public".
+      Se oracle è inconclusivo -> Blocked (mai Active).
+    """
+    is_notion = _is_notion(url)
+
+    # Check 1: HEAD
+    h_code, h_err = _probe_head(url)
+
+    # Definitivi: stop
+    if h_code in (404, 410):
+        return h_code, h_err
+    if h_code in (401, 403, 429, 999):
+        return h_code, h_err
+
+    # Check 2: GET headers-only
+    g_code, g_err = _probe_get_headers_only(url)
+
+    if g_code in (404, 410):
+        return g_code, g_err
+    if g_code in (401, 403, 429, 999):
+        return g_code, g_err
+
+    if g_code is None:
+        # Se GET fallisce, prova a far valere l'HEAD se era presente
+        if h_code is not None:
+            return h_code, g_err or h_err
+        return None, g_err or h_err
+
+    # Non Notion: 2xx/3xx basta
+    if not is_notion:
+        return g_code, g_err
+
+    # Check 3: Notion oracle
+    block_id = _extract_notion_block_id(url)
+    if not block_id:
+        # Per evitare fake Active: Notion senza oracle non diventa mai Active
+        if 200 <= g_code < 400:
+            return 401, "notion_no_block_id_oracle_unavailable"
+        return g_code, g_err
+
+    verdict, reason = _notion_oracle(block_id)
+
+    if verdict == "public":
+        return g_code, None
+    if verdict == "private":
+        return 401, reason or "notion_private"
+    if verdict == "missing":
+        return 404, reason or "notion_missing"
+
+    # Inconclusivo: mai Active
+    return 401, reason or "notion_oracle_inconclusive"
+
+
 def double_check_broken(url: str, c1: Optional[int], e1: Optional[str]) -> Tuple[Optional[int], Optional[str], str]:
+    """
+    Se il primo giro è Broken, fai un secondo tentativo (UA più "browser").
+    Importante: Notion resta protetto dall'oracle in check_url, quindi non generi fake Active.
+    """
     r1 = classify(c1)
     if r1 != "Broken":
         return c1, e1, r1
+
     time.sleep(0.8)
-    c2, e2 = check_url(url)
-    r2 = classify(c2)
+
+    browser_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36"
+    g2, e2 = _probe_get_headers_only(url, user_agent=browser_ua)
+
+    r2 = classify(g2)
     if r2 != "Broken":
-        return c2, e2, r2
+        if _is_notion(url):
+            c3, e3 = check_url(url)
+            r3 = classify(c3)
+            return c3, e3, r3
+        return g2, e2, r2
+
+    c3, e3 = check_url(url)
+    r3 = classify(c3)
+    if r3 != "Broken":
+        return c3, e3, r3
+
     return c1, e1, r1
 
-def check_page_alive(url: str) -> Tuple[bool, Optional[int], Optional[str]]:
-    # la "vita" della pagina la decide HTTP, non Playwright
-    try:
-        r = SESSION.get(url, allow_redirects=True, timeout=TIMEOUT)
-        code = r.status_code
-        return (200 <= code < 400), code, None
-    except requests.RequestException as e:
-        return False, None, type(e).__name__
 
+def check_page_alive(url: str) -> Tuple[bool, Optional[int], Optional[str]]:
+    """La "vita" della pagina la decide HTTP: usa check_url."""
+    code, err = check_url(url)
+    return (code is not None and 200 <= code < 400), code, err
 
 # -------------------------
 # Breadcrumb Trail
