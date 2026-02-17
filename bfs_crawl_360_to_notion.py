@@ -18,11 +18,11 @@ DB B = "Link Occurrences"
 - HTTP Code (number)
 - Error (rich_text)
 - Last Seen (date)
-- Source Page (relation -> DB A)
-- Source Page URL (url)
+- Source Content (relation -> DB A)
+- Source Page URL (rich_text)
 - Anchor Text (rich_text)
 - Context Snippet (rich_text)
-- Breadcrumb (rich_text)
+- Breadcrumb Trail (rich_text)
 - DOM Area (select)
 - Deep Link (url)  ✅ NON accetta "", solo URL valido o null
 - Locator CSS (rich_text)
@@ -335,7 +335,7 @@ def build_db_b_index() -> Tuple[Dict[str, str], Dict[str, Any], str]:
         props = r.get("properties", {})
         src = ""
         try:
-            rel = props.get("Source Page", {}).get("relation") or []
+            rel = props.get("Source Content", {}).get("relation") or props.get("Source Page", {}).get("relation") or []
             if rel:
                 src = rel[0].get("id", "")
         except Exception:
@@ -426,11 +426,11 @@ def upsert_db_b(
         "HTTP Code": set_number(http_code),
         "Error": set_rich_text(error or ""),
         "Last Seen": now_prop,
-        "Source Page": {"relation": [{"id": source_page_id}]},
-        "Source Page URL": set_url(strip_trailing_slash(drop_query(source_page_url))),
+        "Source Content": {"relation": [{"id": source_page_id}]},
+        "Source Page URL": set_rich_text(strip_trailing_slash(drop_query(source_page_url))),
         "Anchor Text": set_rich_text(anchor_text),
         "Context Snippet": set_rich_text(snippet),
-        "Breadcrumb": set_rich_text(breadcrumb),
+        "Breadcrumb Trail": set_rich_text(breadcrumb),
         "DOM Area": set_select(dom_area),
         "Deep Link": set_url(deep_link),
         "Locator CSS": set_rich_text(locator_css),
