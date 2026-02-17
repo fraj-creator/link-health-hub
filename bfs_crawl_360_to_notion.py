@@ -6,33 +6,35 @@ Playwright BFS crawler -> Notion DB A (Link Health Hub 360) + DB B (Link Occurre
 
 ✅ Cose importanti che fa:
 - BFS dal SITE_BASE_URL (senza sitemap) fino a MAX_PAGES (default 120) oppure MAX_TOTAL (totale link-check unici)
-- Estrae solo <a href> (niente asset CSS/JS/img/fonts/pdf ecc)
-- Salva “briciole” (Breadcrumb Trail) basate sul percorso BFS
+- Estrae link con Playwright
 - DB A:
-  - Pages: auto da URL (About, FAQ, Community, Pricing, Docs ecc)
-  - Companies: se trova ?company= o /company/ ecc (best effort)
-  - Status: Active/Broken/Need Review (basato su page alive + broken_in_page)
+  - Status: Active/Broken/Need Review
+  - Broken Links Count / Blocked Links Count / Last Crawled / Primary URL
 - DB B:
-  - Una riga per occorrenza link (URL + pagina sorgente + anchor text + snippet + dom area + risultato)
-- Notifiche Slack (nuovi broken)
+  - Una riga per occorrenza link (URL + pagina sorgente + anchor text + dom area + risultato)
+- Slack (nuovi broken)
 - Filtri: SKIP_DOMAINS, EXCLUDE_DOM_AREAS (Footer/Nav)
 
-🔧 Nuovo: LIMIT_MODE
+🔧 LIMIT_MODE
 - LIMIT_MODE=pages (default) usa MAX_PAGES
 - LIMIT_MODE=total usa MAX_TOTAL (limite di check unici via cache internal/external)
+
+⚠️ Nota:
+- Per Notion esterni: NO parsing HTML. “Active” solo se:
+  - GET headers-only 2xx/3xx
+  - + Oracle Notion (getPublicPageData) conferma public
+  - Se oracle inconclusivo -> Blocked (mai fake Active)
 """
 
 import os
 import re
 import time
-import json
 import hashlib
 from typing import Dict, List, Tuple, Optional, Any, Set
 from collections import deque
 from urllib.parse import urlparse, urljoin
 
 import requests
-
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 
@@ -82,11 +84,7 @@ NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
 SESSION = requests.Session()
-SESSION.headers.update(
-    {
-        "User-Agent": USER_AGENT,
-    }
-)
+SESSION.headers.update({"User-Agent": USER_AGENT})
 
 
 # =========================
@@ -94,26 +92,11 @@ SESSION.headers.update(
 # =========================
 
 ASSET_EXTS = (
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".svg",
-    ".css",
-    ".js",
-    ".ico",
-    ".pdf",
-    ".zip",
-    ".rar",
-    ".7z",
-    ".mp4",
-    ".mp3",
-    ".mov",
-    ".woff",
-    ".woff2",
-    ".ttf",
-    ".otf",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    ".css", ".js", ".ico", ".pdf",
+    ".zip", ".rar", ".7z",
+    ".mp4", ".mp3", ".mov",
+    ".woff", ".woff2", ".ttf", ".otf",
 )
 
 
@@ -154,9 +137,7 @@ def should_ignore_url(u: str) -> bool:
     if not u:
         return True
     lu = u.strip().lower()
-    if lu.startswith("mailto:") or lu.startswith("tel:") or lu.startswith("javascript:"):
-        return True
-    return False
+    return lu.startswith(("mailto:", "tel:", "javascript:"))
 
 
 def is_skipped_domain(d: str) -> bool:
@@ -201,25 +182,27 @@ def _notion_rate_limit_sleep():
 def notion_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     _notion_rate_limit_sleep()
     r = SESSION.post(f"{NOTION_API}{path}", headers=_notion_headers(), json=payload, timeout=TIMEOUT)
-    r.raise_for_status()
+    if not r.ok:
+        print("NOTION POST ERROR:", r.status_code, r.text, flush=True)
+        r.raise_for_status()
     return r.json()
 
 
 def notion_patch(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     _notion_rate_limit_sleep()
     r = SESSION.patch(f"{NOTION_API}{path}", headers=_notion_headers(), json=payload, timeout=TIMEOUT)
-
     if not r.ok:
         print("NOTION PATCH ERROR:", r.status_code, r.text, flush=True)
         r.raise_for_status()
-
     return r.json()
 
 
 def notion_get(path: str) -> Dict[str, Any]:
     _notion_rate_limit_sleep()
     r = SESSION.get(f"{NOTION_API}{path}", headers=_notion_headers(), timeout=TIMEOUT)
-    r.raise_for_status()
+    if not r.ok:
+        print("NOTION GET ERROR:", r.status_code, r.text, flush=True)
+        r.raise_for_status()
     return r.json()
 
 
@@ -243,14 +226,12 @@ def query_db_all(db_id: str) -> List[Dict[str, Any]]:
     return results
 
 
-def get_title(props: Dict[str, Any], title_prop_name: str) -> str:
-    try:
-        arr = props[title_prop_name]["title"]
-        if not arr:
-            return ""
-        return "".join([x.get("plain_text", "") for x in arr]).strip()
-    except Exception:
-        return ""
+def infer_title_prop(schema: Dict[str, Any]) -> str:
+    props = schema.get("properties", {})
+    for k, v in props.items():
+        if v.get("type") == "title":
+            return k
+    raise RuntimeError("No title property found in Notion DB schema")
 
 
 def get_rich_text(props: Dict[str, Any], name: str) -> str:
@@ -280,14 +261,6 @@ def get_select(props: Dict[str, Any], name: str) -> str:
         return ""
 
 
-def get_multi_select(props: Dict[str, Any], name: str) -> List[str]:
-    try:
-        arr = props[name].get("multi_select") or []
-        return [x.get("name", "").strip() for x in arr if x.get("name")]
-    except Exception:
-        return []
-
-
 def set_rich_text(v: str) -> Dict[str, Any]:
     return {"rich_text": [{"type": "text", "text": {"content": v}}]} if v else {"rich_text": []}
 
@@ -302,11 +275,6 @@ def set_url(v: str) -> Dict[str, Any]:
 
 def set_select(v: str) -> Dict[str, Any]:
     return {"select": {"name": v}} if v else {"select": None}
-
-
-def set_multi_select(values: List[str]) -> Dict[str, Any]:
-    values = [x for x in values if x]
-    return {"multi_select": [{"name": v} for v in values]}
 
 
 def set_number(n: Optional[int]) -> Dict[str, Any]:
@@ -330,20 +298,8 @@ def slack_notify(text: str):
         pass
 
 
-# =========================
-# DB A / DB B schema discovery + indexing
-# =========================
-
-def infer_title_prop(schema: Dict[str, Any]) -> str:
-    props = schema.get("properties", {})
-    for k, v in props.items():
-        if v.get("type") == "title":
-            return k
-    raise RuntimeError("No title property found in Notion DB schema")
-
-
-def build_db_a_index(schema: Dict[str, Any]) -> Dict[str, str]:
-    """Map Primary URL -> page_id"""
+def build_db_a_index() -> Tuple[Dict[str, str], Dict[str, Any], str]:
+    schema = fetch_db_schema(DB_A_ID)
     title_prop = infer_title_prop(schema)
     rows = query_db_all(DB_A_ID)
     idx: Dict[str, str] = {}
@@ -352,12 +308,11 @@ def build_db_a_index(schema: Dict[str, Any]) -> Dict[str, str]:
         u = get_url_prop(props, "Primary URL")
         if u:
             idx[strip_trailing_slash(drop_query(u))] = r["id"]
-    schema["_title_prop"] = title_prop
-    return idx
+    return idx, schema, title_prop
 
 
-def build_db_b_index(schema: Dict[str, Any]) -> Dict[str, str]:
-    """Map (SourcePageId + URL + AnchorText + DomArea + LocatorCss) hash -> page_id"""
+def build_db_b_index() -> Tuple[Dict[str, str], Dict[str, Any], str]:
+    schema = fetch_db_schema(DB_B_ID)
     title_prop = infer_title_prop(schema)
     rows = query_db_all(DB_B_ID)
     idx: Dict[str, str] = {}
@@ -376,38 +331,37 @@ def build_db_b_index(schema: Dict[str, Any]) -> Dict[str, str]:
         loc = get_rich_text(props, "Locator CSS")
         key = sha1("|".join([src, strip_trailing_slash(drop_query(u)), a, dom, loc]))
         idx[key] = r["id"]
-    schema["_title_prop"] = title_prop
-    return idx
+    return idx, schema, title_prop
 
 
 # =========================
-# Notion upserts
+# Upserts
 # =========================
 
 def upsert_db_a(
-    db_a_schema: Dict[str, Any],
     db_a_title_prop: str,
     db_a_index: Dict[str, str],
     page_url: str,
     title: str,
     page_alive: bool,
     broken_count: int,
-) -> Tuple[str, Dict[str, Any]]:
+    blocked_count: int,
+) -> str:
     url_key = strip_trailing_slash(drop_query(page_url))
     now_prop = set_date_now()
 
     status_val = "Active"
     if not page_alive:
         status_val = "Broken"
-    else:
-        if broken_count > 0:
-            status_val = "Need Review"
+    elif broken_count > 0:
+        status_val = "Need Review"
 
     props_payload = {
         db_a_title_prop: set_title(title or url_key),
         "Primary URL": set_url(url_key),
         "Status": set_select(status_val),
-        "Broken Count": set_number(broken_count),
+        "Broken Links Count": set_number(broken_count),
+        "Blocked Links Count": set_number(blocked_count),
         "Last Crawled": now_prop,
     }
 
@@ -415,22 +369,18 @@ def upsert_db_a(
         page_id = db_a_index[url_key]
         if FORCE_TOUCH_EXISTING or BACKFILL_MISSING:
             notion_patch(f"/pages/{page_id}", {"properties": props_payload})
-        return page_id, db_a_schema
+        return page_id
 
     data = notion_post(
         "/pages",
-        {
-            "parent": {"database_id": DB_A_ID},
-            "properties": props_payload,
-        },
+        {"parent": {"database_id": DB_A_ID}, "properties": props_payload},
     )
     page_id = data["id"]
     db_a_index[url_key] = page_id
-    return page_id, db_a_schema
+    return page_id
 
 
 def upsert_db_b(
-    db_b_schema: Dict[str, Any],
     db_b_title_prop: str,
     db_b_index: Dict[str, str],
     source_page_id: str,
@@ -447,13 +397,12 @@ def upsert_db_b(
     deep_link: str,
     locator_css: str,
     pages_val_for_b: str,
-) -> Tuple[bool, Dict[str, Any]]:
+) -> bool:
     url_key = strip_trailing_slash(drop_query(link_url))
     now_prop = set_date_now()
-
     title_val = f"{link_type_val}: {url_key}"
-
     key = sha1("|".join([source_page_id, url_key, anchor_text, dom_area, locator_css]))
+
     props_payload = {
         db_b_title_prop: set_title(title_val),
         "URL": set_url(url_key),
@@ -483,24 +432,21 @@ def upsert_db_b(
             if old_result != "Broken" and result_val == "Broken":
                 newly_broken = True
             notion_patch(f"/pages/{page_id}", {"properties": props_payload})
-        return newly_broken, db_b_schema
+        return newly_broken
 
     data = notion_post(
         "/pages",
-        {
-            "parent": {"database_id": DB_B_ID},
-            "properties": props_payload,
-        },
+        {"parent": {"database_id": DB_B_ID}, "properties": props_payload},
     )
     page_id = data["id"]
     db_b_index[key] = page_id
     if result_val == "Broken":
         newly_broken = True
-    return newly_broken, db_b_schema
+    return newly_broken
 
 
 # =========================
-# Page classification helpers (DB A/B)
+# Page helpers
 # =========================
 
 def classify_page_group(url: str) -> str:
@@ -522,23 +468,6 @@ def classify_page_group(url: str) -> str:
     return mapping.get(first, first.capitalize())
 
 
-def infer_company(url: str) -> str:
-    # best effort: query param company= or /company/<name>
-    try:
-        p = urlparse(url)
-        qs = p.query or ""
-        m = re.search(r"(?:^|[&?])company=([^&]+)", qs)
-        if m:
-            return m.group(1)
-        path = (p.path or "").strip("/")
-        m2 = re.search(r"company/([^/]+)", path)
-        if m2:
-            return m2.group(1)
-        return ""
-    except Exception:
-        return ""
-
-
 def normalize_url(base: str, href: str) -> str:
     if not href:
         return ""
@@ -549,7 +478,6 @@ def normalize_url(base: str, href: str) -> str:
 
 
 def breadcrumb_for(url: str, parent: Dict[str, Optional[str]]) -> str:
-    # risale i parent BFS
     trail = []
     cur = url
     seen_local = set()
@@ -558,7 +486,6 @@ def breadcrumb_for(url: str, parent: Dict[str, Optional[str]]) -> str:
         trail.append(cur)
         cur = parent.get(cur)
     trail.reverse()
-    # rendiamo breadcrumb corto (solo path)
     paths = []
     for u in trail:
         try:
@@ -576,16 +503,12 @@ def breadcrumb_for(url: str, parent: Dict[str, Optional[str]]) -> str:
 def _is_notion(url: str) -> bool:
     try:
         netloc = urlparse(url).netloc.lower()
-        return netloc.endswith("notion.site") or netloc.endswith("notion.so") or netloc == "www.notion.so" or netloc == "notion.so"
+        return netloc.endswith("notion.site") or netloc.endswith("notion.so") or netloc in ("www.notion.so", "notion.so")
     except Exception:
         return False
 
 
 def _extract_notion_block_id(url: str) -> Optional[str]:
-    """
-    Estrae un page/block id Notion (32 hex) dall'URL, anche se contiene slug o trattini.
-    Restituisce UUID nel formato 8-4-4-4-12 oppure None.
-    """
     try:
         clean = re.sub(r"[^0-9a-fA-F]", "", url)
         m = re.search(r"([0-9a-fA-F]{32})", clean)
@@ -598,9 +521,6 @@ def _extract_notion_block_id(url: str) -> Optional[str]:
 
 
 def _probe_head(url: str, timeout: int = TIMEOUT) -> Tuple[Optional[int], Optional[str]]:
-    """
-    HEAD con redirect. Non legge body.
-    """
     try:
         r = SESSION.head(
             url,
@@ -622,9 +542,6 @@ def _probe_head(url: str, timeout: int = TIMEOUT) -> Tuple[Optional[int], Option
 
 
 def _probe_get_headers_only(url: str, timeout: int = TIMEOUT, user_agent: Optional[str] = None) -> Tuple[Optional[int], Optional[str]]:
-    """
-    GET con stream=True ma chiude subito: ottieni status + headers, senza leggere HTML.
-    """
     try:
         r = SESSION.get(
             url,
@@ -648,12 +565,7 @@ def _probe_get_headers_only(url: str, timeout: int = TIMEOUT, user_agent: Option
 
 def _notion_oracle(block_id: str, timeout: int = TIMEOUT) -> Tuple[Optional[str], Optional[str]]:
     """
-    Terzo check "forte" per Notion: usa getPublicPageData (senza HTML).
-    Ritorna (verdict, reason):
-      - ("public",  None)  -> pagina pubblica/accessibile
-      - ("private", reason)-> esiste ma non accessibile (permission/login)
-      - ("missing", reason)-> non trovata / rimossa
-      - (None,     reason)-> inconclusivo (timeout/rate limit/risposta strana)
+    getPublicPageData: verdict = public|private|missing|None(inconclusive)
     """
     try:
         resp = SESSION.post(
@@ -675,7 +587,6 @@ def _notion_oracle(block_id: str, timeout: int = TIMEOUT) -> Tuple[Optional[str]
             return "public", None
 
         sc = resp.status_code
-
         payload_str = ""
         try:
             payload_str = str(data).lower()
@@ -714,25 +625,15 @@ def classify(code: Optional[int]) -> str:
 
 
 def check_url(url: str) -> Tuple[Optional[int], Optional[str]]:
-    """
-    Logica forte, NO parsing HTML:
-    - Check 1: HEAD
-    - Check 2: GET headers-only
-    - Check 3 (solo Notion): getPublicPageData (oracle)
-      Active su Notion SOLO se oracle conferma public.
-      Se oracle è inconclusivo -> Blocked (mai Active).
-    """
     is_notion = _is_notion(url)
 
     h_code, h_err = _probe_head(url)
-
     if h_code in (404, 410):
         return h_code, h_err
     if h_code in (401, 403, 429, 999):
         return h_code, h_err
 
     g_code, g_err = _probe_get_headers_only(url)
-
     if g_code in (404, 410):
         return g_code, g_err
     if g_code in (401, 403, 429, 999):
@@ -747,21 +648,20 @@ def check_url(url: str) -> Tuple[Optional[int], Optional[str]]:
 
     block_id = _extract_notion_block_id(url)
     if not block_id:
+        # No oracle -> never Active for notion
         if 200 <= g_code < 400:
             return 401, "notion_no_block_id_oracle_unavailable"
         return g_code, g_err
 
     verdict, reason = _notion_oracle(block_id)
-
     if verdict == "public":
         return g_code, None
-
     if verdict == "private":
         return 401, reason or "notion_private"
-
     if verdict == "missing":
         return 404, reason or "notion_missing"
 
+    # inconclusive -> never Active
     return 401, reason or "notion_oracle_inconclusive"
 
 
@@ -771,7 +671,6 @@ def double_check_broken(url: str, c1: Optional[int], e1: Optional[str]) -> Tuple
         return c1, e1, r1
 
     time.sleep(0.8)
-
     browser_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36"
     g2, e2 = _probe_get_headers_only(url, user_agent=browser_ua)
 
@@ -801,38 +700,22 @@ def check_page_alive(url: str) -> Tuple[bool, Optional[int], Optional[str]]:
 # =========================
 
 def extract_links_playwright(page, base_url: str) -> List[Dict[str, str]]:
-    """
-    Estrae link in modo robusto.
-    Ritorna lista di dict:
-      href, anchor_text, snippet, dom_area, locator_css, deep_link
-    """
     items: List[Dict[str, str]] = []
 
-    # 1) normal <a>
     anchors = page.locator("a[href]")
     n = anchors.count()
-    for i in range(min(n, 400)):
+    for i in range(min(n, 500)):
         try:
             a = anchors.nth(i)
             href = a.get_attribute("href") or ""
             text = (a.inner_text() or "").strip()
-            dom_area = "Main"
-            locator_css = ""
-            deep_link = ""
             items.append(
-                {
-                    "href": href,
-                    "anchor_text": text,
-                    "snippet": "",
-                    "dom_area": dom_area,
-                    "locator_css": locator_css,
-                    "deep_link": deep_link,
-                }
+                {"href": href, "anchor_text": text, "snippet": "", "dom_area": "Main", "locator_css": "", "deep_link": ""}
             )
         except Exception:
             continue
 
-    # 2) best effort: accordion/tabs open to reveal deep links
+    # best effort: open some toggles
     try:
         toggles = page.locator("[aria-expanded='false'], button[aria-controls]")
         tcount = toggles.count()
@@ -845,23 +728,15 @@ def extract_links_playwright(page, base_url: str) -> List[Dict[str, str]]:
     except Exception:
         pass
 
-    # extract again after opening some UI
     anchors2 = page.locator("a[href]")
     n2 = anchors2.count()
-    for i in range(min(n2, 500)):
+    for i in range(min(n2, 800)):
         try:
             a = anchors2.nth(i)
             href = a.get_attribute("href") or ""
             text = (a.inner_text() or "").strip()
             items.append(
-                {
-                    "href": href,
-                    "anchor_text": text,
-                    "snippet": "",
-                    "dom_area": "Accordion",
-                    "locator_css": "",
-                    "deep_link": "",
-                }
+                {"href": href, "anchor_text": text, "snippet": "", "dom_area": "Accordion", "locator_css": "", "deep_link": ""}
             )
         except Exception:
             continue
@@ -879,24 +754,17 @@ def main():
     if domain.startswith("www."):
         domain = domain[4:]
 
-    db_a_schema = fetch_db_schema(DB_A_ID)
-    db_b_schema = fetch_db_schema(DB_B_ID)
-
-    db_a_title_prop = infer_title_prop(db_a_schema)
-    db_b_title_prop = infer_title_prop(db_b_schema)
-
-    db_a_index = build_db_a_index(db_a_schema)
-    db_b_index = build_db_b_index(db_b_schema)
+    db_a_index, db_a_schema, db_a_title_prop = build_db_a_index()
+    db_b_index, db_b_schema, db_b_title_prop = build_db_b_index()
     print(f"DB A indexed: {len(db_a_index)} rows; DB B indexed: {len(db_b_index)} rows", flush=True)
 
     queue = deque([base])
     parent: Dict[str, Optional[str]] = {base: None}
-    seen = set()
+    seen: Set[str] = set()
     pages_crawled = 0
     total_checks = 0
     stop_due_to_total = False
 
-    # cache solo DURANTE run
     external_cache: Dict[str, Tuple[Optional[int], Optional[str], str]] = {}
     internal_cache: Dict[str, Tuple[Optional[int], Optional[str], str]] = {}
 
@@ -907,11 +775,13 @@ def main():
         context = browser.new_context(viewport={"width": 1280, "height": 800})
         page = context.new_page()
 
-        print(f"Starting Playwright BFS from {base} (LIMIT_MODE={LIMIT_MODE}, MAX_PAGES={MAX_PAGES}, MAX_TOTAL={MAX_TOTAL})", flush=True)
+        print(
+            f"Starting Playwright BFS from {base} (LIMIT_MODE={LIMIT_MODE}, MAX_PAGES={MAX_PAGES}, MAX_TOTAL={MAX_TOTAL})",
+            flush=True,
+        )
 
         while queue and (LIMIT_MODE != "pages" or pages_crawled < MAX_PAGES) and (LIMIT_MODE != "total" or total_checks < MAX_TOTAL):
-            page_url = strip_trailing_slash(queue.popleft())
-            page_url = drop_query(page_url)
+            page_url = strip_trailing_slash(drop_query(queue.popleft()))
 
             if page_url in seen:
                 continue
@@ -924,7 +794,6 @@ def main():
             pages_crawled += 1
             breadcrumb = breadcrumb_for(page_url, parent)
 
-            # Visit page
             page_title = page_url
             alive, code_page, err_page = False, None, ""
             try:
@@ -940,14 +809,12 @@ def main():
 
             merged = extract_links_playwright(page, page_url)
 
-            # Enqueue internal pages (BFS)
+            # Enqueue internal pages
             for it in merged:
                 absu = normalize_url(page_url, it.get("href", ""))
                 if not absu:
                     continue
-                absu = strip_trailing_slash(absu)
-                absu = drop_query(absu)
-
+                absu = strip_trailing_slash(drop_query(absu))
                 if should_ignore_url(absu) or has_skipped_extension(absu):
                     continue
                 if same_domain(absu, domain):
@@ -956,29 +823,27 @@ def main():
                     if absu not in seen:
                         queue.append(absu)
 
-            # DB A (pass 1): crea/aggiorna pagina con broken_count=0 (poi la correggiamo a fine pagina)
-            page_id, db_a_schema = upsert_db_a(
-                db_a_schema=db_a_schema,
+            # DB A pass 1
+            page_id = upsert_db_a(
                 db_a_title_prop=db_a_title_prop,
                 db_a_index=db_a_index,
                 page_url=page_url,
                 title=page_title,
                 page_alive=alive,
                 broken_count=0,
+                blocked_count=0,
             )
 
             broken_in_page = 0
-            unique_links_in_page = set()
+            blocked_in_page = 0
+            unique_links_in_page: Set[str] = set()
 
-            # Link loop
             for it in merged:
                 link_url = normalize_url(page_url, it.get("href", ""))
                 if not link_url:
                     continue
-                link_url = strip_trailing_slash(link_url)
-                link_url = drop_query(link_url)
+                link_url = strip_trailing_slash(drop_query(link_url))
 
-                # ignora asset
                 if should_ignore_url(link_url) or has_skipped_extension(link_url):
                     continue
 
@@ -986,7 +851,6 @@ def main():
                 if dom_area in EXCLUDE_DOM_AREAS_SET:
                     continue
 
-                # dedupe dentro la stessa pagina
                 if link_url in unique_links_in_page:
                     continue
                 unique_links_in_page.add(link_url)
@@ -996,11 +860,8 @@ def main():
                 locator_css = it.get("locator_css", "") or ""
                 deep_link = it.get("deep_link", "") or ""
 
-                pages_val = classify_page_group(page_url)
-                company_val = infer_company(page_url)
-                pages_val_for_b = pages_val
+                pages_val_for_b = classify_page_group(page_url)
 
-                # decide external/internal + check
                 if same_domain(link_url, domain):
                     if not CHECK_INTERNAL:
                         continue
@@ -1024,7 +885,6 @@ def main():
                     link_type_val = "External"
                     d = domain_of(link_url)
 
-                    # skip domains (robusto su www.)
                     if is_skipped_domain(d):
                         code, err, result_val = None, "skipped_domain", "Blocked"
                     else:
@@ -1043,9 +903,10 @@ def main():
 
                 if result_val == "Broken":
                     broken_in_page += 1
+                if result_val == "Blocked":
+                    blocked_in_page += 1
 
-                newly_broken, db_b_schema = upsert_db_b(
-                    db_b_schema=db_b_schema,
+                newly_broken = upsert_db_b(
                     db_b_title_prop=db_b_title_prop,
                     db_b_index=db_b_index,
                     source_page_id=page_id,
@@ -1067,34 +928,36 @@ def main():
                 if newly_broken:
                     newly_broken_alerts.append(f"• {page_title} ({page_url}) -> {link_url}")
 
-            # DB A (pass 2): aggiorna status in base a broken links
-            _, db_a_schema = upsert_db_a(
-                db_a_schema=db_a_schema,
+            # DB A pass 2 (final counts)
+            upsert_db_a(
                 db_a_title_prop=db_a_title_prop,
                 db_a_index=db_a_index,
                 page_url=page_url,
                 title=page_title,
                 page_alive=alive,
                 broken_count=broken_in_page,
+                blocked_count=blocked_in_page,
             )
 
             print(
-                f"[pages={pages_crawled}/" + (str(MAX_PAGES) if LIMIT_MODE=="pages" else "∞") + f" total={total_checks}/" + (str(MAX_TOTAL) if LIMIT_MODE=="total" else "∞") + f"] {page_title} | Pages={pages_val} | Company={company_val or '-'} "
-                f"| alive={alive} | broken_in_page={broken_in_page} | queue={len(queue)}",
-                flush=True
+                f"[pages={pages_crawled}/" + (str(MAX_PAGES) if LIMIT_MODE == "pages" else "∞")
+                + f" total={total_checks}/" + (str(MAX_TOTAL) if LIMIT_MODE == "total" else "∞")
+                + f"] {page_title} | alive={alive} | broken={broken_in_page} | blocked={blocked_in_page} | queue={len(queue)}",
+                flush=True,
             )
 
-        if stop_due_to_total:
-            print(f"Stopping: reached MAX_TOTAL={MAX_TOTAL} unique link checks (pages_crawled={pages_crawled})", flush=True)
-            browser.close()
-            return
+            if stop_due_to_total:
+                break
 
         browser.close()
+
+    if stop_due_to_total:
+        print(f"Stopping: reached MAX_TOTAL={MAX_TOTAL} unique link checks (pages_crawled={pages_crawled})", flush=True)
 
     if newly_broken_alerts:
         msg = "⚠️ Link Health Hub 360: Newly broken links\n" + "\n".join(newly_broken_alerts[:25])
         if len(newly_broken_alerts) > 25:
-            msg += f"\n… and {len(newly_broken_alerts)-25} more."
+            msg += f"\n… and {len(newly_broken_alerts) - 25} more."
         slack_notify(msg)
 
     print(f"Done. Pages crawled={pages_crawled} | total_checks={total_checks} | LIMIT_MODE={LIMIT_MODE}", flush=True)
