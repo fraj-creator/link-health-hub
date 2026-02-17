@@ -936,10 +936,10 @@ def main():
         print(f"Stopping: reached MAX_TOTAL={MAX_TOTAL} unique link checks (pages_crawled={pages_crawled})", flush=True)
 
     if newly_broken_alerts:
-    msg = "⚠️ Link Health Hub 360: Newly broken links\n" + "\n".join(newly_broken_alerts[:25])
-    if len(newly_broken_alerts) > 25:
-        msg += f"\n… and {len(newly_broken_alerts) - 25} more."
-    slack_notify(msg)
+        msg = "⚠️ Link Health Hub 360: Newly broken links\n" + "\n".join(newly_broken_alerts[:25])
+        if len(newly_broken_alerts) > 25:
+            msg += f"\n… and {len(newly_broken_alerts) - 25} more."
+        slack_notify(msg)
 
     print(f"Done. Pages crawled={pages_crawled} | total_checks={total_checks} | LIMIT_MODE={LIMIT_MODE}", flush=True)
 
