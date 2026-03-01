@@ -1,6 +1,8 @@
 name: LinkHealth BFS (120 test)
 
 on:
+  schedule:
+    - cron: "0 6 * * 1"  # ogni lunedì alle 06:00 UTC
   workflow_dispatch:
     inputs:
       limit_mode:
@@ -60,23 +62,19 @@ jobs:
           SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-          # NEW: mode + limits
-          LIMIT_MODE: ${{ inputs.limit_mode }}
-          MAX_PAGES: ${{ inputs.max_pages }}
-          MAX_TOTAL: ${{ inputs.max_total }}
+          LIMIT_MODE: ${{ inputs.limit_mode || 'pages' }}
+          MAX_PAGES: ${{ inputs.max_pages || '120' }}
+          MAX_TOTAL: ${{ inputs.max_total || '2000' }}
 
           CHECK_EXTERNAL: "true"
           CHECK_INTERNAL: "true"
 
-          # timing: evita timeout/rate limit Notion
           NOTION_MIN_INTERVAL: "1.0"
           CRAWL_SLEEP: "0.35"
 
-          # backfill + riallineamento
           BACKFILL_MISSING: "true"
           FORCE_TOUCH_EXISTING: "true"
 
-          # filtri utili
           SKIP_DOMAINS: "linkedin.com"
           EXCLUDE_DOM_AREAS: "Footer,Nav"
 

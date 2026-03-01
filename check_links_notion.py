@@ -24,14 +24,46 @@ NOTION_HEADERS = {
 }
 
 
+def notion_request(method: str, url: str, **kwargs) -> requests.Response:
+    """
+    FIX: wrapper with retry on Notion 429 (rate-limit) and 5xx errors.
+    Up to 5 attempts with exponential backoff.
+    """
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.request(method, url, headers=NOTION_HEADERS, timeout=TIMEOUT, **kwargs)
+        except requests.RequestException as e:
+            print(f"Notion {method} network error (attempt {attempt}/{max_attempts}): {e}")
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After", 2 ** attempt))
+            print(f"Notion 429 rate-limit. Waiting {retry_after}s (attempt {attempt}/{max_attempts})")
+            time.sleep(retry_after)
+            continue
+
+        if r.status_code >= 500:
+            print(f"Notion {r.status_code} server error (attempt {attempt}/{max_attempts}): {r.text[:200]}")
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+                continue
+
+        return r
+
+    raise RuntimeError(f"Notion {method} {url} failed after {max_attempts} attempts")
+
+
 def notion_query_database(database_id: str, start_cursor: str | None = None) -> dict:
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
     payload: dict = {}
     if start_cursor:
         payload["start_cursor"] = start_cursor
-    r = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=TIMEOUT)
+    r = notion_request("POST", url, json=payload)
     if not r.ok:
-        # Helpful debug output in GitHub Actions logs (does not print secrets)
         print("Notion error:", r.status_code, r.text)
     r.raise_for_status()
     return r.json()
@@ -39,8 +71,7 @@ def notion_query_database(database_id: str, start_cursor: str | None = None) -> 
 
 def notion_update_page(page_id: str, properties: dict) -> None:
     url = f"https://api.notion.com/v1/pages/{page_id}"
-    payload = {"properties": properties}
-    r = requests.patch(url, headers=NOTION_HEADERS, json=payload, timeout=TIMEOUT)
+    r = notion_request("PATCH", url, json={"properties": properties})
     if not r.ok:
         print("Notion update error:", r.status_code, r.text)
     r.raise_for_status()
@@ -71,28 +102,19 @@ def get_status(props: dict) -> str | None:
 
 def get_pages(props: dict) -> str:
     """
-    Reads the Notion property named "Pages".
-    Supports Select or Multi-select. Returns a readable label.
+    FIX: Simplified — no duplicate fallback logic.
+    Reads "Pages" property. Supports Select and Multi-select.
     """
     p = get_prop(props, "Pages")
+    ptype = p.get("type")
 
-    # Select
-    if p.get("type") == "select" and p.get("select"):
-        return p["select"].get("name", "")
+    if ptype == "select":
+        sel = p.get("select")
+        return sel.get("name", "") if sel else ""
 
-    # Multi-select
-    if p.get("type") == "multi_select":
+    if ptype == "multi_select":
         items = p.get("multi_select", [])
-        names = [x.get("name", "") for x in items if x.get("name")]
-        return ", ".join(names)
-
-    # Fallbacks
-    if "select" in p and p.get("select"):
-        return p["select"].get("name", "")
-    if "multi_select" in p:
-        items = p.get("multi_select", [])
-        names = [x.get("name", "") for x in items if x.get("name")]
-        return ", ".join(names)
+        return ", ".join(x.get("name", "") for x in items if x.get("name"))
 
     return ""
 
@@ -144,7 +166,6 @@ def status_from_code(code: int | None) -> str:
 
 # ---- Slack notify (optional) ----
 def slack_notify(text: str) -> None:
-    webhook = None
     if SLACK_MODE == "test":
         webhook = SLACK_TEST_WEBHOOK_URL
     else:
@@ -209,11 +230,9 @@ def main():
                 props_to_update["Last Checked"] = {"date": {"start": now_iso}}
 
             if "HTTP Code" in props:
-                # "HTTP Code" should be a Number property in Notion
                 props_to_update["HTTP Code"] = {"number": float(code) if code is not None else None}
 
             if "Check Error" in props:
-                # "Check Error" can be a Rich text property
                 props_to_update["Check Error"] = {"rich_text": [{"text": {"content": err or ""}}]}
 
             if props_to_update:
@@ -229,10 +248,7 @@ def main():
 
     print(f"Done. Checked={checked}, Status updated={updated}")
 
-    # Slack message formatting rules requested:
-    # - "link" vs "links"
-    # - Pages in bold
-    # - URL hidden behind "Link"
+    # Slack message
     if newly_broken:
         n = len(newly_broken)
         noun = "link" if n == 1 else "links"

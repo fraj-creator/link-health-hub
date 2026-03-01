@@ -1,0 +1,30 @@
+name: Check Links (Notion DB)
+
+on:
+  schedule:
+    - cron: "0 7 * * *"  # ogni giorno alle 07:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run link checker
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_TEST_WEBHOOK_URL: ${{ secrets.SLACK_TEST_WEBHOOK_URL }}
+          SLACK_MODE: ${{ vars.SLACK_MODE || 'prod' }}
+        run: python check_links_notion.py

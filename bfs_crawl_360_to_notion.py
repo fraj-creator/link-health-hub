@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-bfs_crawl_360_to_notion.py (FINAL)
+bfs_crawl_360_to_notion.py
 
-Basato sulle colonne viste nei tuoi CSV:
 DB A = "Link Health Hub 360"
 - Primary URL (url)
 - Status (select) -> Active / Broken / Need Review
@@ -24,7 +23,7 @@ DB B = "Link Occurrences"
 - Context Snippet (rich_text)
 - Breadcrumb Trail (rich_text)
 - DOM Area (select)
-- Deep Link (url)  ✅ NON accetta "", solo URL valido o null
+- Deep Link (url)
 - Locator CSS (rich_text)
 - Pages (select)
 
@@ -43,6 +42,7 @@ import os
 import re
 import time
 import hashlib
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional, Any, Set
 from collections import deque
 from urllib.parse import urlparse, urljoin
@@ -171,7 +171,7 @@ def normalize_url(base: str, href: str) -> str:
 
 
 # =============================================================================
-# Notion API helpers
+# Notion API helpers (with retry on 429 / 5xx)
 # =============================================================================
 
 _last_notion_call = 0.0
@@ -194,31 +194,64 @@ def _notion_rate_limit_sleep():
     _last_notion_call = time.time()
 
 
+def _notion_request(method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Generic Notion API call with automatic retry on 429 (rate-limit) and 5xx (server errors).
+    Uses exponential backoff with up to 5 attempts.
+    """
+    url = f"{NOTION_API}{path}"
+    headers = _notion_headers()
+    max_attempts = 5
+
+    for attempt in range(1, max_attempts + 1):
+        _notion_rate_limit_sleep()
+        try:
+            if method == "POST":
+                r = SESSION.post(url, headers=headers, json=payload or {}, timeout=TIMEOUT)
+            elif method == "PATCH":
+                r = SESSION.patch(url, headers=headers, json=payload or {}, timeout=TIMEOUT)
+            elif method == "GET":
+                r = SESSION.get(url, headers=headers, timeout=TIMEOUT)
+            else:
+                raise ValueError(f"Unknown method: {method}")
+        except requests.RequestException as e:
+            print(f"Notion {method} network error (attempt {attempt}/{max_attempts}): {e}", flush=True)
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After", 2 ** attempt))
+            print(f"Notion 429 rate-limit. Waiting {retry_after}s (attempt {attempt}/{max_attempts})", flush=True)
+            time.sleep(retry_after)
+            continue
+
+        if r.status_code >= 500:
+            print(f"Notion {r.status_code} server error (attempt {attempt}/{max_attempts}): {r.text[:200]}", flush=True)
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)
+                continue
+
+        if not r.ok:
+            print(f"NOTION {method} ERROR {r.status_code}: {r.text[:400]}", flush=True)
+            r.raise_for_status()
+
+        return r.json()
+
+    raise RuntimeError(f"Notion {method} {path} failed after {max_attempts} attempts")
+
+
 def notion_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _notion_rate_limit_sleep()
-    r = SESSION.post(f"{NOTION_API}{path}", headers=_notion_headers(), json=payload, timeout=TIMEOUT)
-    if not r.ok:
-        print("NOTION POST ERROR:", r.status_code, r.text, flush=True)
-        r.raise_for_status()
-    return r.json()
+    return _notion_request("POST", path, payload)
 
 
 def notion_patch(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    _notion_rate_limit_sleep()
-    r = SESSION.patch(f"{NOTION_API}{path}", headers=_notion_headers(), json=payload, timeout=TIMEOUT)
-    if not r.ok:
-        print("NOTION PATCH ERROR:", r.status_code, r.text, flush=True)
-        r.raise_for_status()
-    return r.json()
+    return _notion_request("PATCH", path, payload)
 
 
 def notion_get(path: str) -> Dict[str, Any]:
-    _notion_rate_limit_sleep()
-    r = SESSION.get(f"{NOTION_API}{path}", headers=_notion_headers(), timeout=TIMEOUT)
-    if not r.ok:
-        print("NOTION GET ERROR:", r.status_code, r.text, flush=True)
-        r.raise_for_status()
-    return r.json()
+    return _notion_request("GET", path)
 
 
 def fetch_db_schema(db_id: str) -> Dict[str, Any]:
@@ -284,7 +317,7 @@ def set_title(v: str) -> Dict[str, Any]:
 
 def set_url(v: Optional[str]) -> Dict[str, Any]:
     vv = (v or "").strip()
-    return {"url": vv if vv else None}  # ✅ no ""
+    return {"url": vv if vv else None}
 
 
 def set_select(v: str) -> Dict[str, Any]:
@@ -297,7 +330,8 @@ def set_number(n: Optional[int]) -> Dict[str, Any]:
 
 
 def set_date_now() -> Dict[str, Any]:
-    return {"date": {"start": time.strftime("%Y-%m-%dT%H:%M:%S")}}
+    # FIX: use UTC so timestamps in Notion are always consistent regardless of runner timezone
+    return {"date": {"start": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")}}
 
 
 def sha1(s: str) -> str:
@@ -308,7 +342,7 @@ def slack_notify(text: str):
     if not SLACK_WEBHOOK_URL:
         return
     try:
-        SESSION.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=TIMEOUT)
+        SESSION.post(SLACK_WEBHOOK_URL, json={"text": text, "mrkdwn": True}, timeout=TIMEOUT)
     except Exception:
         pass
 
@@ -326,11 +360,15 @@ def build_db_a_index() -> Tuple[Dict[str, str], Dict[str, Any], str]:
     return idx, schema, title_prop
 
 
-def build_db_b_index() -> Tuple[Dict[str, str], Dict[str, Any], str]:
+def build_db_b_index() -> Tuple[Dict[str, Tuple[str, str]], Dict[str, Any], str]:
+    """
+    FIX: index now stores (page_id, old_result) instead of just page_id.
+    This eliminates one notion_get() per link inside upsert_db_b.
+    """
     schema = fetch_db_schema(DB_B_ID)
     title_prop = infer_title_prop(schema)
     rows = query_db_all(DB_B_ID)
-    idx: Dict[str, str] = {}
+    idx: Dict[str, Tuple[str, str]] = {}
     for r in rows:
         props = r.get("properties", {})
         src = ""
@@ -344,14 +382,45 @@ def build_db_b_index() -> Tuple[Dict[str, str], Dict[str, Any], str]:
         a = get_rich_text(props, "Anchor Text")
         dom = get_select(props, "DOM Area")
         loc = get_rich_text(props, "Locator CSS")
+        result = get_select(props, "Result")  # FIX: read existing result
         key = sha1("|".join([src, strip_trailing_slash(drop_query(u)), a, dom, loc]))
-        idx[key] = r["id"]
+        idx[key] = (r["id"], result)
     return idx, schema, title_prop
 
 
 # =============================================================================
 # Upserts
 # =============================================================================
+
+def get_or_create_db_a(
+    db_a_title_prop: str,
+    db_a_index: Dict[str, str],
+    page_url: str,
+    title: str,
+) -> str:
+    """
+    FIX: lightweight first call — only creates the row if missing, returns page_id.
+    Does NOT patch existing rows (avoids writing 0 counts before the real upsert).
+    """
+    url_key = strip_trailing_slash(drop_query(page_url))
+
+    if url_key in db_a_index:
+        return db_a_index[url_key]
+
+    # Create with placeholder counts; real counts written by upsert_db_a after the loop
+    props_payload = {
+        db_a_title_prop: set_title(title or url_key),
+        "Primary URL": set_url(url_key),
+        "Status": set_select("Active"),
+        "Broken Links Count": set_number(0),
+        "Blocked Links Count": set_number(0),
+        "Last Crawled": set_date_now(),
+    }
+    data = notion_post("/pages", {"parent": {"database_id": DB_A_ID}, "properties": props_payload})
+    page_id = data["id"]
+    db_a_index[url_key] = page_id
+    return page_id
+
 
 def upsert_db_a(
     db_a_title_prop: str,
@@ -394,7 +463,7 @@ def upsert_db_a(
 
 def upsert_db_b(
     db_b_title_prop: str,
-    db_b_index: Dict[str, str],
+    db_b_index: Dict[str, Tuple[str, str]],
     source_page_id: str,
     source_page_url: str,
     link_url: str,
@@ -414,7 +483,7 @@ def upsert_db_b(
     now_prop = set_date_now()
 
     title_val = f"{link_type_val}: {url_key}"
-    deep_link = (deep_link or "").strip() or None  # ✅
+    deep_link = (deep_link or "").strip() or None
 
     key = sha1("|".join([source_page_id, url_key, anchor_text, dom_area, locator_css]))
 
@@ -440,18 +509,17 @@ def upsert_db_b(
     newly_broken = False
 
     if key in db_b_index:
-        page_id = db_b_index[key]
+        page_id, old_result = db_b_index[key]  # FIX: read old result from index, no extra notion_get
         if FORCE_TOUCH_EXISTING or BACKFILL_MISSING:
-            existing = notion_get(f"/pages/{page_id}")
-            old_result = get_select(existing.get("properties", {}), "Result")
             if old_result != "Broken" and result_val == "Broken":
                 newly_broken = True
             notion_patch(f"/pages/{page_id}", {"properties": props_payload})
+            db_b_index[key] = (page_id, result_val)  # update cached result
         return newly_broken
 
     data = notion_post("/pages", {"parent": {"database_id": DB_B_ID}, "properties": props_payload})
     page_id = data["id"]
-    db_b_index[key] = page_id
+    db_b_index[key] = (page_id, result_val)
     if result_val == "Broken":
         newly_broken = True
     return newly_broken
@@ -698,7 +766,14 @@ def check_page_alive(url: str) -> Tuple[bool, Optional[int], Optional[str]]:
 # =============================================================================
 
 def extract_links_playwright(page) -> List[Dict[str, str]]:
+    """
+    FIX: deduplicate links between first pass (Main) and second pass (Accordion).
+    Second pass only appends hrefs that were not already seen in the first pass.
+    """
     items: List[Dict[str, str]] = []
+    seen_hrefs: Set[str] = set()
+
+    # First pass — links visible without clicking
     anchors = page.locator("a[href]")
     n = anchors.count()
     for i in range(min(n, 800)):
@@ -707,9 +782,11 @@ def extract_links_playwright(page) -> List[Dict[str, str]]:
             href = a.get_attribute("href") or ""
             text = (a.inner_text() or "").strip()
             items.append({"href": href, "anchor_text": text, "dom_area": "Main"})
+            seen_hrefs.add(href)
         except Exception:
             continue
 
+    # Click accordion / toggles to reveal hidden links
     try:
         toggles = page.locator("[aria-expanded='false'], button[aria-controls]")
         tcount = toggles.count()
@@ -722,14 +799,18 @@ def extract_links_playwright(page) -> List[Dict[str, str]]:
     except Exception:
         pass
 
+    # Second pass — only add hrefs that were NOT in the first pass
     anchors2 = page.locator("a[href]")
     n2 = anchors2.count()
     for i in range(min(n2, 1000)):
         try:
             a = anchors2.nth(i)
             href = a.get_attribute("href") or ""
+            if href in seen_hrefs:
+                continue  # FIX: skip already-seen links, avoids duplicates
             text = (a.inner_text() or "").strip()
             items.append({"href": href, "anchor_text": text, "dom_area": "Accordion"})
+            seen_hrefs.add(href)
         except Exception:
             continue
 
@@ -763,7 +844,7 @@ def main():
     external_cache: Dict[str, Tuple[Optional[int], Optional[str], str]] = {}
     internal_cache: Dict[str, Tuple[Optional[int], Optional[str], str]] = {}
 
-    newly_broken_alerts: List[str] = []
+    newly_broken_alerts: List[Tuple[str, str, str, str]] = []  # (page_group, page_title, page_url, link_url)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -810,14 +891,12 @@ def main():
                     if absu not in seen:
                         queue.append(absu)
 
-            page_id = upsert_db_a(
+            # FIX: use get_or_create to avoid writing placeholder zeros when row already exists
+            page_id = get_or_create_db_a(
                 db_a_title_prop=db_a_title_prop,
                 db_a_index=db_a_index,
                 page_url=page_url,
                 title=page_title,
-                page_alive=alive,
-                broken_count=0,
-                blocked_count=0,
             )
 
             broken_in_page = 0
@@ -908,8 +987,10 @@ def main():
                 )
 
                 if newly_broken:
-                    newly_broken_alerts.append(f"• {page_title} ({page_url}) -> {link_url}")
+                    pg = classify_page_group(page_url)
+                    newly_broken_alerts.append((pg, page_title, page_url, link_url))
 
+            # FIX: single final upsert_db_a with real counts (no more double-write)
             upsert_db_a(
                 db_a_title_prop=db_a_title_prop,
                 db_a_index=db_a_index,
@@ -935,11 +1016,19 @@ def main():
     if stop_due_to_total:
         print(f"Stopping: reached MAX_TOTAL={MAX_TOTAL} unique link checks (pages_crawled={pages_crawled})", flush=True)
 
+    # FIX: Slack message with proper mrkdwn formatting (consistent with check_links_notion.py)
     if newly_broken_alerts:
-        msg = "⚠️ Link Health Hub 360: Newly broken links\n" + "\n".join(newly_broken_alerts[:25])
-        if len(newly_broken_alerts) > 25:
-            msg += f"\n… and {len(newly_broken_alerts) - 25} more."
-        slack_notify(msg)
+        n = len(newly_broken_alerts)
+        noun = "link" if n == 1 else "links"
+        lines = [f"⚠️ Link Health Hub 360: {n} newly broken {noun}:"]
+        for pg, title, src_url, lnk_url in newly_broken_alerts[:20]:
+            pg_bold = f"*{pg}*"
+            src_link = f"<{src_url}|{title}>"
+            broken_link = f"<{lnk_url}|Link>"
+            lines.append(f"• {pg_bold} {src_link} → {broken_link}")
+        if n > 20:
+            lines.append(f"…and {n - 20} more.")
+        slack_notify("\n".join(lines))
 
     print(f"Done. Pages crawled={pages_crawled} | total_checks={total_checks} | LIMIT_MODE={LIMIT_MODE}", flush=True)
 
