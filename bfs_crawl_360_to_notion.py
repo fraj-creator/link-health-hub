@@ -48,6 +48,7 @@ from collections import deque
 from urllib.parse import urlparse, urljoin
 
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 
@@ -79,6 +80,10 @@ SKIP_DOMAINS = os.environ.get("SKIP_DOMAINS", "").strip()
 EXCLUDE_DOM_AREAS = os.environ.get("EXCLUDE_DOM_AREAS", "").strip()
 
 TIMEOUT = int(os.environ.get("TIMEOUT", "12"))
+# OPT: freshness window — skip re-checking links that were Active within N hours
+FRESH_HOURS = int(os.environ.get("FRESH_HOURS", "20"))
+# OPT: parallel HTTP workers for link checking (ThreadPoolExecutor)
+PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "8"))
 
 USER_AGENT = os.environ.get(
     "USER_AGENT",
@@ -347,6 +352,41 @@ def slack_notify(text: str):
         pass
 
 
+def _is_fresh_active(result: str, last_seen_str: str, now_utc: datetime) -> bool:
+    """
+    OPT: Return True if the link was confirmed Active within FRESH_HOURS.
+    Fresh Active links skip both HTTP re-check and Notion write (big speed-up).
+    """
+    if FRESH_HOURS <= 0 or result != "Active" or not last_seen_str:
+        return False
+    try:
+        last_seen = datetime.fromisoformat(last_seen_str.replace("Z", "+00:00"))
+        age_h = (now_utc - last_seen).total_seconds() / 3600
+        return age_h < FRESH_HOURS
+    except Exception:
+        return False
+
+
+def _http_check_worker(url: str) -> Tuple[str, Optional[int], Optional[str], str]:
+    """
+    OPT: Pure HTTP link check — safe to run in ThreadPoolExecutor (no Playwright, no Notion).
+    Returns (url, code, err, result).
+    For Broken: does a second-UA retry before giving up.
+    """
+    c1, e1 = check_url(url)
+    r1 = classify(c1)
+    if r1 != "Broken":
+        return url, c1, e1, r1
+    # Retry with Windows Chrome UA (some servers respond differently)
+    time.sleep(0.4)
+    browser_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36"
+    c2, e2 = _probe_get_headers_only(url, user_agent=browser_ua)
+    r2 = classify(c2)
+    if r2 != "Broken":
+        return url, c2, e2, r2
+    return url, c1, e1, r1
+
+
 def build_db_a_index() -> Tuple[Dict[str, str], Dict[str, Any], str]:
     schema = fetch_db_schema(DB_A_ID)
     title_prop = infer_title_prop(schema)
@@ -360,15 +400,20 @@ def build_db_a_index() -> Tuple[Dict[str, str], Dict[str, Any], str]:
     return idx, schema, title_prop
 
 
-def build_db_b_index() -> Tuple[Dict[str, Tuple[str, str]], Dict[str, Any], str]:
+def build_db_b_index() -> Tuple[Dict[str, Tuple[str, str, str]], Dict[str, Tuple[str, str]], Dict[str, Any], str]:
     """
-    FIX: index now stores (page_id, old_result) instead of just page_id.
-    This eliminates one notion_get() per link inside upsert_db_b.
+    Returns:
+      idx           - sha1_key -> (page_id, old_result, last_seen_str)
+      url_last_seen - url_key  -> (result, last_seen_str)  most-recent entry per URL
+      schema, title_prop
+    OPT: url_last_seen is used to pre-populate caches so recently-Active links
+    skip both HTTP re-check and Notion write (major speed-up for daily runs).
     """
     schema = fetch_db_schema(DB_B_ID)
     title_prop = infer_title_prop(schema)
     rows = query_db_all(DB_B_ID)
-    idx: Dict[str, Tuple[str, str]] = {}
+    idx: Dict[str, Tuple[str, str, str]] = {}
+    url_last_seen: Dict[str, Tuple[str, str]] = {}
     for r in rows:
         props = r.get("properties", {})
         src = ""
@@ -382,10 +427,20 @@ def build_db_b_index() -> Tuple[Dict[str, Tuple[str, str]], Dict[str, Any], str]
         a = get_rich_text(props, "Anchor Text")
         dom = get_select(props, "DOM Area")
         loc = get_rich_text(props, "Locator CSS")
-        result = get_select(props, "Result")  # FIX: read existing result
-        key = sha1("|".join([src, strip_trailing_slash(drop_query(u)), a, dom, loc]))
-        idx[key] = (r["id"], result)
-    return idx, schema, title_prop
+        result = get_select(props, "Result")
+        last_seen_str = ""
+        try:
+            ls = props.get("Last Seen", {}).get("date") or {}
+            last_seen_str = ls.get("start", "") or ""
+        except Exception:
+            pass
+        url_key = strip_trailing_slash(drop_query(u))
+        key = sha1("|".join([src, url_key, a, dom, loc]))
+        idx[key] = (r["id"], result, last_seen_str)
+        # Keep most recent last_seen per url (for freshness cache)
+        if url_key and (url_key not in url_last_seen or last_seen_str > url_last_seen[url_key][1]):
+            url_last_seen[url_key] = (result, last_seen_str)
+    return idx, url_last_seen, schema, title_prop
 
 
 # =============================================================================
@@ -509,17 +564,17 @@ def upsert_db_b(
     newly_broken = False
 
     if key in db_b_index:
-        page_id, old_result = db_b_index[key]  # FIX: read old result from index, no extra notion_get
+        page_id, old_result, _ = db_b_index[key]  # unpack 3-tuple (page_id, result, last_seen)
         if FORCE_TOUCH_EXISTING or BACKFILL_MISSING:
             if old_result != "Broken" and result_val == "Broken":
                 newly_broken = True
             notion_patch(f"/pages/{page_id}", {"properties": props_payload})
-            db_b_index[key] = (page_id, result_val)  # update cached result
+            db_b_index[key] = (page_id, result_val, "")  # reset last_seen (just written)
         return newly_broken
 
     data = notion_post("/pages", {"parent": {"database_id": DB_B_ID}, "properties": props_payload})
     page_id = data["id"]
-    db_b_index[key] = (page_id, result_val)
+    db_b_index[key] = (page_id, result_val, "")
     if result_val == "Broken":
         newly_broken = True
     return newly_broken
@@ -866,9 +921,15 @@ def main():
         domain = domain[4:]
 
     db_a_index, _, db_a_title_prop = build_db_a_index()
-    db_b_index, _, db_b_title_prop = build_db_b_index()
+    # OPT: url_last_seen lets us pre-populate caches with recently-Active links
+    db_b_index, url_last_seen, _, db_b_title_prop = build_db_b_index()
 
     print(f"DB A indexed: {len(db_a_index)} rows; DB B indexed: {len(db_b_index)} rows", flush=True)
+    print(
+        f"OPT settings: FRESH_HOURS={FRESH_HOURS} PARALLEL_WORKERS={PARALLEL_WORKERS} "
+        f"NOTION_MIN_INTERVAL={NOTION_MIN_INTERVAL}",
+        flush=True,
+    )
     print(f"Starting Playwright BFS from {base} (LIMIT_MODE={LIMIT_MODE}, MAX_PAGES={MAX_PAGES}, MAX_TOTAL={MAX_TOTAL})", flush=True)
 
     queue = deque([base])
@@ -884,12 +945,21 @@ def main():
 
     newly_broken_alerts: List[Tuple[str, str, str, str]] = []  # (page_group, page_title, page_url, link_url)
 
+    # OPT: Pre-populate caches with recently-Active links → skip HTTP re-check + Notion write
+    now_utc = datetime.now(timezone.utc)
+    fresh_count = 0
+    for url_key, (result, last_seen_str) in url_last_seen.items():
+        if _is_fresh_active(result, last_seen_str, now_utc):
+            target = internal_cache if same_domain(url_key, domain) else external_cache
+            target[url_key] = (200, None, "Active")
+            fresh_count += 1
+    print(f"OPT: {fresh_count} URLs pre-loaded from freshness cache (skip HTTP + Notion write)", flush=True)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(viewport={"width": 1280, "height": 800})
         page = context.new_page()
-        # Separate page used only for checking Blocked/Broken links with real browser
-        # Kept separate so it doesn't interfere with the BFS crawl page
+        # Separate Playwright page used ONLY for Blocked URL checks (not the BFS crawl page)
         check_page = context.new_page()
 
         while queue and (LIMIT_MODE != "pages" or pages_crawled < MAX_PAGES) and (LIMIT_MODE != "total" or total_checks < MAX_TOTAL):
@@ -919,6 +989,7 @@ def main():
 
             links = extract_links_playwright(page)
 
+            # Queue new internal pages discovered on this page
             for it in links:
                 absu = normalize_url(page_url, it.get("href", ""))
                 if not absu:
@@ -932,7 +1003,25 @@ def main():
                     if absu not in seen:
                         queue.append(absu)
 
-            # FIX: use get_or_create to avoid writing placeholder zeros when row already exists
+            # Deduplicate links for this page (respecting DOM exclusions)
+            unique_links_map: Dict[str, Dict] = {}  # link_url -> first occurrence metadata
+            for it in links:
+                link_url = normalize_url(page_url, it.get("href", ""))
+                if not link_url:
+                    continue
+                link_url = strip_trailing_slash(drop_query(link_url))
+                if should_ignore_url(link_url) or has_skipped_extension(link_url):
+                    continue
+                dom_area = (it.get("dom_area", "Main") or "Main").strip()
+                if dom_area in EXCLUDE_DOM_AREAS_SET:
+                    continue
+                if link_url not in unique_links_map:
+                    unique_links_map[link_url] = {
+                        "anchor_text": it.get("anchor_text", "") or "",
+                        "dom_area": dom_area,
+                    }
+
+            # FIX: get_or_create DB A row (lightweight, no placeholder write)
             page_id = get_or_create_db_a(
                 db_a_title_prop=db_a_title_prop,
                 db_a_index=db_a_index,
@@ -940,68 +1029,94 @@ def main():
                 title=page_title,
             )
 
+            # ----------------------------------------------------------------
+            # OPT PHASE 1: collect uncached links that need HTTP checks
+            # ----------------------------------------------------------------
+            to_check_http: List[str] = []
+            for link_url in list(unique_links_map.keys()):
+                is_int = same_domain(link_url, domain)
+                if is_int and not CHECK_INTERNAL:
+                    continue
+                if not is_int and not CHECK_EXTERNAL:
+                    continue
+                cache = internal_cache if is_int else external_cache
+                if link_url in cache:
+                    continue  # already have result (from freshness or earlier page)
+                d = domain_of(link_url)
+                if is_skipped_domain(d):
+                    cache[link_url] = (None, "skipped_domain", "Blocked")
+                    continue
+                if LIMIT_MODE == "total" and total_checks >= MAX_TOTAL:
+                    stop_due_to_total = True
+                    break
+                to_check_http.append(link_url)
+                total_checks += 1
+
+            # ----------------------------------------------------------------
+            # OPT PHASE 2: parallel HTTP check (ThreadPoolExecutor, safe — no Playwright, no Notion)
+            # ----------------------------------------------------------------
+            if to_check_http:
+                with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+                    futures = {executor.submit(_http_check_worker, u): u for u in to_check_http}
+                    for future in as_completed(futures):
+                        u = futures[future]
+                        try:
+                            _, code, err, result = future.result()
+                        except Exception as exc:
+                            code, err, result = None, str(exc), "Broken"
+                        is_int = same_domain(u, domain)
+                        cache = internal_cache if is_int else external_cache
+                        cache[u] = (code, err, result)
+
+            # ----------------------------------------------------------------
+            # OPT PHASE 3: sequential Playwright for Blocked URLs (not thread-safe)
+            # ----------------------------------------------------------------
+            for link_url in to_check_http:
+                is_int = same_domain(link_url, domain)
+                cache = internal_cache if is_int else external_cache
+                code, err, result = cache.get(link_url, (None, "not_checked", "Broken"))
+                if result == "Blocked":
+                    c_pw, e_pw = _probe_playwright_status(check_page, link_url)
+                    r_pw = classify(c_pw)
+                    final_code = c_pw if c_pw is not None else code
+                    final_err = e_pw or err
+                    cache[link_url] = (final_code, final_err, r_pw)
+                    print(f"  Playwright fallback for Blocked: {link_url} → {c_pw} ({r_pw})", flush=True)
+
+            # ----------------------------------------------------------------
+            # PHASE 4: Notion writes for all unique links on this page
+            # (freshness-cached links are already in cache as (200, None, "Active")
+            #  so they write to Notion only if something changed, otherwise skip)
+            # ----------------------------------------------------------------
             broken_in_page = 0
             blocked_in_page = 0
-            unique_links_in_page: Set[str] = set()
 
-            for it in links:
-                link_url = normalize_url(page_url, it.get("href", ""))
-                if not link_url:
+            for link_url, meta in unique_links_map.items():
+                is_int = same_domain(link_url, domain)
+                if is_int and not CHECK_INTERNAL:
                     continue
-                link_url = strip_trailing_slash(drop_query(link_url))
-
-                if should_ignore_url(link_url) or has_skipped_extension(link_url):
+                if not is_int and not CHECK_EXTERNAL:
                     continue
 
-                dom_area = (it.get("dom_area", "Main") or "Main").strip()
-                if dom_area in EXCLUDE_DOM_AREAS_SET:
-                    continue
+                link_type_val = "Internal" if is_int else "External"
+                cache = internal_cache if is_int else external_cache
 
-                if link_url in unique_links_in_page:
-                    continue
-                unique_links_in_page.add(link_url)
+                if link_url not in cache:
+                    continue  # couldn't check (total limit hit etc.)
 
-                anchor_text = it.get("anchor_text", "") or ""
-                snippet = ""
-                locator_css = ""
-                deep_link = None
+                code, err, result_val = cache[link_url]
 
-                pages_val_for_b = classify_page_group(page_url)
-
-                if same_domain(link_url, domain):
-                    if not CHECK_INTERNAL:
-                        continue
-                    link_type_val = "Internal"
-                    if link_url in internal_cache:
-                        code, err, result_val = internal_cache[link_url]
-                    else:
-                        if LIMIT_MODE == "total" and total_checks >= MAX_TOTAL:
-                            stop_due_to_total = True
-                            break
-                        total_checks += 1
-                        c1, e1 = check_url(link_url)
-                        code, err, result_val = double_check_broken(link_url, c1, e1, pw_page=check_page)
-                        internal_cache[link_url] = (code, err, result_val)
-                        time.sleep(CRAWL_SLEEP)
-                else:
-                    if not CHECK_EXTERNAL:
-                        continue
-                    link_type_val = "External"
-                    d = domain_of(link_url)
-                    if is_skipped_domain(d):
-                        code, err, result_val = None, "skipped_domain", "Blocked"
-                    else:
-                        if link_url in external_cache:
-                            code, err, result_val = external_cache[link_url]
-                        else:
-                            if LIMIT_MODE == "total" and total_checks >= MAX_TOTAL:
-                                stop_due_to_total = True
-                                break
-                            total_checks += 1
-                            c1, e1 = check_url(link_url)
-                            code, err, result_val = double_check_broken(link_url, c1, e1, pw_page=check_page)
-                            external_cache[link_url] = (code, err, result_val)
-                            time.sleep(CRAWL_SLEEP)
+                # OPT: if this URL was freshness-cached (pre-populated as Active)
+                # AND it's still Active in cache → skip Notion write entirely
+                # (Last Seen stays at its real last-checked timestamp)
+                url_key = link_url
+                if (
+                    url_key in url_last_seen
+                    and url_last_seen[url_key][0] == "Active"
+                    and result_val == "Active"
+                    and _is_fresh_active("Active", url_last_seen[url_key][1], now_utc)
+                ):
+                    continue  # skip Notion write — link is fresh + unchanged
 
                 if result_val == "Broken":
                     broken_in_page += 1
@@ -1018,18 +1133,40 @@ def main():
                     result_val=result_val,
                     http_code=code,
                     error=err or "",
-                    anchor_text=anchor_text,
-                    snippet=snippet,
+                    anchor_text=meta.get("anchor_text", ""),
+                    snippet="",
                     breadcrumb=breadcrumb,
-                    dom_area=dom_area,
-                    deep_link=deep_link,
-                    locator_css=locator_css,
-                    pages_val_for_b=pages_val_for_b,
+                    dom_area=meta.get("dom_area", "Main"),
+                    deep_link=None,
+                    locator_css="",
+                    pages_val_for_b=classify_page_group(page_url),
                 )
 
                 if newly_broken:
                     pg = classify_page_group(page_url)
                     newly_broken_alerts.append((pg, page_title, page_url, link_url))
+
+            # Count broken/blocked even for freshness-cached links (look from cache)
+            for link_url in unique_links_map:
+                cache = internal_cache if same_domain(link_url, domain) else external_cache
+                if link_url not in cache:
+                    continue
+                _, _, rv = cache[link_url]
+                if rv == "Broken":
+                    broken_in_page += 1
+                if rv == "Blocked":
+                    blocked_in_page += 1
+            # Divide by 2 because we counted twice (loop above + this loop for fresh)
+            # Actually - only fresh Active links are in cache but skipped above.
+            # The upsert loop already counted non-fresh Broken/Blocked. Let's just recount cleanly.
+            broken_in_page = sum(
+                1 for lk in unique_links_map
+                if (internal_cache if same_domain(lk, domain) else external_cache).get(lk, (None, None, ""))[2] == "Broken"
+            )
+            blocked_in_page = sum(
+                1 for lk in unique_links_map
+                if (internal_cache if same_domain(lk, domain) else external_cache).get(lk, (None, None, ""))[2] == "Blocked"
+            )
 
             # FIX: single final upsert_db_a with real counts (no more double-write)
             upsert_db_a(
@@ -1042,10 +1179,13 @@ def main():
                 blocked_count=blocked_in_page,
             )
 
+            checked_this_page = len(to_check_http)
+            fresh_this_page = len(unique_links_map) - checked_this_page
             print(
                 f"[pages={pages_crawled}/" + (str(MAX_PAGES) if LIMIT_MODE == "pages" else "∞")
                 + f" total={total_checks}/" + (str(MAX_TOTAL) if LIMIT_MODE == "total" else "∞")
-                + f"] {page_title} | alive={alive} | broken={broken_in_page} | blocked={blocked_in_page} | queue={len(queue)}",
+                + f"] {page_title} | alive={alive} | broken={broken_in_page} | blocked={blocked_in_page}"
+                + f" | checked={checked_this_page} fresh_skip={fresh_this_page} | queue={len(queue)}",
                 flush=True,
             )
 
@@ -1057,7 +1197,7 @@ def main():
     if stop_due_to_total:
         print(f"Stopping: reached MAX_TOTAL={MAX_TOTAL} unique link checks (pages_crawled={pages_crawled})", flush=True)
 
-    # FIX: Slack message with proper mrkdwn formatting (consistent with check_links_notion.py)
+    # FIX: Slack message with proper mrkdwn formatting
     if newly_broken_alerts:
         n = len(newly_broken_alerts)
         noun = "link" if n == 1 else "links"

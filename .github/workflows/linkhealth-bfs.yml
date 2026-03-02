@@ -1,8 +1,8 @@
-name: LinkHealth BFS (120 test)
+name: LinkHealth BFS
 
 on:
   schedule:
-    - cron: "0 6 * * 1"  # ogni lunedì alle 06:00 UTC
+    - cron: "0 6 * * *"  # ogni giorno alle 06:00 UTC
   workflow_dispatch:
     inputs:
       limit_mode:
@@ -24,10 +24,15 @@ on:
         required: true
         default: "2000"
 
+      fresh_hours:
+        description: "Skip links checked within N hours and still Active (0 = always recheck all)"
+        required: false
+        default: "20"
+
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 40
 
     steps:
       - uses: actions/checkout@v4
@@ -69,8 +74,13 @@ jobs:
           CHECK_EXTERNAL: "true"
           CHECK_INTERNAL: "true"
 
-          NOTION_MIN_INTERVAL: "1.0"
-          CRAWL_SLEEP: "0.35"
+          # OPT: reduced from 1.0s — Notion allows ~3 req/s per integration
+          NOTION_MIN_INTERVAL: "0.4"
+          # OPT: parallel workers for HTTP link checking (ThreadPoolExecutor)
+          PARALLEL_WORKERS: "8"
+          # OPT: links confirmed Active within N hours are skipped (no HTTP recheck, no Notion write)
+          # Set to 0 on manual runs when you want a full recheck of everything
+          FRESH_HOURS: ${{ inputs.fresh_hours || '20' }}
 
           BACKFILL_MISSING: "true"
           FORCE_TOUCH_EXISTING: "true"
