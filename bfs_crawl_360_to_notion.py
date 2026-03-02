@@ -733,8 +733,38 @@ def check_url(url: str) -> Tuple[Optional[int], Optional[str]]:
     return 401, reason or "notion_oracle_inconclusive"
 
 
-def double_check_broken(url: str, c1: Optional[int], e1: Optional[str]) -> Tuple[Optional[int], Optional[str], str]:
+def _probe_playwright_status(pw_page, url: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Use a real Playwright browser to check a URL.
+    Bypasses anti-bot detection (LinkedIn, Instagram, news sites etc.)
+    because it's a real Chrome browser, not an HTTP request.
+    """
+    try:
+        response = pw_page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        if response:
+            return response.status, None
+        return None, "playwright_no_response"
+    except PlaywrightTimeout:
+        return None, "playwright_timeout"
+    except Exception as e:
+        return None, type(e).__name__
+
+
+def double_check_broken(
+    url: str,
+    c1: Optional[int],
+    e1: Optional[str],
+    pw_page=None,
+) -> Tuple[Optional[int], Optional[str], str]:
     r1 = classify(c1)
+
+    # If Blocked (anti-bot 403/999), try immediately with Playwright real browser
+    if r1 == "Blocked" and pw_page is not None:
+        c_pw, e_pw = _probe_playwright_status(pw_page, url)
+        r_pw = classify(c_pw)
+        print(f"  Playwright fallback for Blocked URL: {url} → {c_pw} ({r_pw})", flush=True)
+        return c_pw, e_pw, r_pw
+
     if r1 != "Broken":
         return c1, e1, r1
 
@@ -747,6 +777,14 @@ def double_check_broken(url: str, c1: Optional[int], e1: Optional[str]) -> Tuple
             c3, e3 = check_url(url)
             return c3, e3, classify(c3)
         return g2, e2, r2
+
+    # Last resort: try Playwright even for Broken links
+    if pw_page is not None:
+        c_pw, e_pw = _probe_playwright_status(pw_page, url)
+        r_pw = classify(c_pw)
+        if r_pw != "Broken":
+            print(f"  Playwright rescued Broken URL: {url} → {c_pw} ({r_pw})", flush=True)
+            return c_pw, e_pw, r_pw
 
     c3, e3 = check_url(url)
     r3 = classify(c3)
@@ -850,6 +888,9 @@ def main():
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(viewport={"width": 1280, "height": 800})
         page = context.new_page()
+        # Separate page used only for checking Blocked/Broken links with real browser
+        # Kept separate so it doesn't interfere with the BFS crawl page
+        check_page = context.new_page()
 
         while queue and (LIMIT_MODE != "pages" or pages_crawled < MAX_PAGES) and (LIMIT_MODE != "total" or total_checks < MAX_TOTAL):
             page_url = strip_trailing_slash(drop_query(queue.popleft()))
@@ -939,7 +980,7 @@ def main():
                             break
                         total_checks += 1
                         c1, e1 = check_url(link_url)
-                        code, err, result_val = double_check_broken(link_url, c1, e1)
+                        code, err, result_val = double_check_broken(link_url, c1, e1, pw_page=check_page)
                         internal_cache[link_url] = (code, err, result_val)
                         time.sleep(CRAWL_SLEEP)
                 else:
@@ -958,7 +999,7 @@ def main():
                                 break
                             total_checks += 1
                             c1, e1 = check_url(link_url)
-                            code, err, result_val = double_check_broken(link_url, c1, e1)
+                            code, err, result_val = double_check_broken(link_url, c1, e1, pw_page=check_page)
                             external_cache[link_url] = (code, err, result_val)
                             time.sleep(CRAWL_SLEEP)
 
