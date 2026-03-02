@@ -32,7 +32,8 @@ jobs:
 
       - name: Run Careers Checker
         env:
-          CAREERS_URL: ${{ secrets.CAREERS_URL }}
+          # URL pubblica, non serve secret
+          CAREERS_URL: "https://careers.marble.studio/jobs"
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
           # Optional: Notion DB to track job status over time
