@@ -3,15 +3,15 @@
 """
 careers_checker.py
 
-Checks job listings on https://careers.marble.studio/jobs (or any careers URL).
-Uses Playwright to render the page (handles JS-based career platforms like Ashby,
-Lever, Greenhouse, Workable, etc.) then checks each job link.
+Checks job listings on https://careers.marble.studio/jobs (Getro platform).
+Uses Playwright to render the page, then for each job:
+  1. Clicks the job link
+  2. Detects the Getro interstitial popup ("You're about to go to X's website")
+  3. Clicks "No thanks, take me to the application form"
+  4. Verifies the final application page loads (200 OK)
 
-Alerts via Slack if:
-  - Any job URL returns a broken response (404 / 5xx / network error)
-  - The number of open positions changed from last run (if Notion tracking enabled)
-
-Optionally writes job status to a Notion database for tracking over time.
+Alerts via Slack if any job's application form is broken/unreachable.
+Optionally tracks job status history in a Notion database.
 
 ENV vars:
   Required:
@@ -21,21 +21,21 @@ ENV vars:
   Optional:
     NOTION_TOKEN           - for writing job status to Notion
     NOTION_CAREERS_DB_ID   - Notion DB to track jobs (if empty, Notion write is skipped)
-    CHECK_TIMEOUT          - seconds per HTTP check (default 15)
-    JOBS_PAGE_LOAD_WAIT    - ms to wait for JS to render jobs (default 4000)
+    CHECK_TIMEOUT          - seconds per check (default 20)
+    JOBS_PAGE_LOAD_WAIT    - ms to wait for JS to render jobs list (default 4000)
+    POPUP_WAIT_MS          - ms to wait for Getro popup to appear (default 3000)
     SLACK_ALWAYS_NOTIFY    - "true" = always send summary, even if all OK (default false)
 """
 
 import os
-import re
 import time
 import hashlib
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout, Page
 
 # =============================================================================
 # ENV
@@ -45,8 +45,9 @@ CAREERS_URL = os.environ.get("CAREERS_URL", "https://careers.marble.studio/jobs"
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
 NOTION_CAREERS_DB_ID = os.environ.get("NOTION_CAREERS_DB_ID", "").strip()
-CHECK_TIMEOUT = int(os.environ.get("CHECK_TIMEOUT", "15"))
-JOBS_PAGE_LOAD_WAIT = int(os.environ.get("JOBS_PAGE_LOAD_WAIT", "4000"))  # ms
+CHECK_TIMEOUT = int(os.environ.get("CHECK_TIMEOUT", "20"))
+JOBS_PAGE_LOAD_WAIT = int(os.environ.get("JOBS_PAGE_LOAD_WAIT", "4000"))   # ms
+POPUP_WAIT_MS = int(os.environ.get("POPUP_WAIT_MS", "3000"))               # ms
 SLACK_ALWAYS_NOTIFY = os.environ.get("SLACK_ALWAYS_NOTIFY", "false").lower() == "true"
 
 NOTION_API = "https://api.notion.com/v1"
@@ -91,7 +92,7 @@ def iso_now() -> str:
 
 def slack_notify(text: str):
     if not SLACK_WEBHOOK_URL:
-        print(f"[SLACK SKIP] no webhook configured. Message:\n{text}", flush=True)
+        print(f"[SLACK SKIP] no webhook. Message:\n{text}", flush=True)
         return
     try:
         r = SESSION.post(SLACK_WEBHOOK_URL, json={"text": text, "mrkdwn": True}, timeout=10)
@@ -101,44 +102,36 @@ def slack_notify(text: str):
 
 
 # =============================================================================
-# Playwright: extract jobs from careers page
+# Playwright: extract job listings from the careers page
 # =============================================================================
 
-# Common selectors used by various career platforms (Ashby, Lever, Greenhouse,
-# Workable, custom pages, etc.) in order of specificity
+# Selectors ordered from most specific (Getro) to generic fallback
 JOB_LINK_SELECTORS = [
-    # Ashby
+    # Getro-specific
     "a[href*='/jobs/']",
     "a[href*='/job/']",
-    "a[href*='/opening/']",
+    # Common job card links
+    ".job-listing a",
+    ".job-card a",
+    "article.job a",
+    "li.job a",
+    ".opening a",
     # Lever
-    "a[href*='/l/']",
     "a.posting-title",
     # Greenhouse
     "a.job-post",
-    ".opening a",
-    # Workable
-    "li.job a",
-    "article.job a",
-    # Generic job card links
-    ".job-listing a",
-    ".job-card a",
-    ".job-item a",
-    ".position a",
-    "[data-job] a",
-    "[data-testid*='job'] a",
-    # Very generic fallback
+    # Generic fallback
     "main a[href]",
 ]
 
 
-def extract_job_links_playwright(page, careers_url: str) -> List[Dict[str, str]]:
+def extract_job_listings(page: Page, careers_url: str) -> List[Dict[str, str]]:
     """
-    Render the careers page with Playwright and extract job links.
+    Extract job listings from the rendered careers page.
     Returns list of {"title": str, "url": str, "department": str}.
     """
     base_domain = domain_of(careers_url)
-    found: Dict[str, Dict] = {}  # url -> {title, department}
+    found: Dict[str, Dict] = {}  # url -> metadata
 
     for selector in JOB_LINK_SELECTORS:
         try:
@@ -155,20 +148,18 @@ def extract_job_links_playwright(page, careers_url: str) -> List[Dict[str, str]]
                     abs_url = normalize_url(careers_url, href)
                     if not abs_url:
                         continue
-                    # Only follow links that look like job postings (same domain or known platform)
                     el_domain = domain_of(abs_url)
+                    # Accept same domain or known career platforms
                     if el_domain not in (base_domain, "") and not _is_known_job_platform(abs_url):
                         continue
-                    # Skip if URL is just the careers listing page itself
                     if abs_url.rstrip("/") == careers_url.rstrip("/"):
                         continue
                     if abs_url not in found:
-                        title = _extract_job_title(el)
-                        department = _extract_job_department(el)
-                        found[abs_url] = {"title": title, "url": abs_url, "department": department}
+                        title = _extract_title(el)
+                        dept = _extract_department(el)
+                        found[abs_url] = {"title": title, "url": abs_url, "department": dept}
                 except Exception:
                     continue
-            # If we found a good number with this selector, don't keep expanding
             if len(found) >= 3:
                 break
         except Exception:
@@ -178,133 +169,228 @@ def extract_job_links_playwright(page, careers_url: str) -> List[Dict[str, str]]
 
 
 def _is_known_job_platform(url: str) -> bool:
-    """Return True if URL points to a known career hosting platform."""
     known = (
         "ashbyhq.com", "lever.co", "greenhouse.io", "workable.com",
-        "recruitee.com", "smartrecruiters.com", "jobvite.com",
-        "myworkdayjobs.com", "icims.com", "taleo.net",
+        "recruitee.com", "smartrecruiters.com", "myworkdayjobs.com",
+        "getro.com", "getro.app",
     )
     d = domain_of(url)
     return any(d.endswith(k) for k in known)
 
 
-def _extract_job_title(el) -> str:
-    """Extract job title from an <a> element or its children."""
+def _extract_title(el) -> str:
+    for sel in ["h2", "h3", "h4", ".title", ".job-title", "[class*='title']", "strong"]:
+        try:
+            t = el.locator(sel).first.inner_text().strip()
+            if t and len(t) > 2:
+                return t[:200]
+        except Exception:
+            pass
     try:
-        # Try specific title elements first
-        for sel in ["h2", "h3", "h4", ".title", ".job-title", "[class*='title']", "strong"]:
-            try:
-                child = el.locator(sel).first
-                t = child.inner_text().strip()
-                if t and len(t) > 2:
-                    return t[:200]
-            except Exception:
-                pass
-        # Fallback to link text
         t = el.inner_text().strip()
         return t[:200] if t else "Unknown Position"
     except Exception:
         return "Unknown Position"
 
 
-def _extract_job_department(el) -> str:
-    """Try to extract department from job card."""
-    try:
-        for sel in [".department", ".team", ".category", "[class*='department']", "[class*='team']", "span"]:
-            try:
-                child = el.locator(sel).first
-                t = child.inner_text().strip()
-                if t and len(t) > 1 and len(t) < 60:
-                    return t
-            except Exception:
-                pass
-        # Try parent container
-        parent = el.locator("xpath=..").first
-        for sel in [".department", ".team", "span"]:
-            try:
-                child = parent.locator(sel).first
-                t = child.inner_text().strip()
-                if t and len(t) < 60:
-                    return t
-            except Exception:
-                pass
-    except Exception:
-        pass
+def _extract_department(el) -> str:
+    for sel in [".department", ".team", ".category", "[class*='department']", "span"]:
+        try:
+            t = el.locator(sel).first.inner_text().strip()
+            if t and 1 < len(t) < 60:
+                return t
+        except Exception:
+            pass
     return ""
 
 
 # =============================================================================
-# HTTP check for individual job URLs
+# Playwright: check a single job URL, handling the Getro popup
 # =============================================================================
 
+# Text variants for the "skip popup" link on Getro and similar platforms
+SKIP_POPUP_TEXTS = [
+    "no thanks, take me to the application form",
+    "no thanks",
+    "take me to the application form",
+    "skip",
+    "go to application",
+    "continue to application",
+    "apply directly",
+    "go directly",
+]
 
-def check_job_url(url: str) -> Tuple[Optional[int], Optional[str], str]:
+
+def check_job_with_playwright(pw_page: Page, job_url: str) -> Tuple[Optional[int], Optional[str], str, str]:
     """
-    Returns (http_code, error_msg, result) where result is "Active" | "Broken" | "Blocked".
-    Uses HEAD first, falls back to GET.
+    Navigate to a job URL, handle the Getro interstitial popup if present,
+    then verify the final application page loads.
+
+    Returns (http_code, error_msg, result, final_url) where result is:
+      "Active"  - application form loaded OK
+      "Broken"  - application form returned 4xx/5xx or couldn't load
+      "Blocked" - anti-bot or auth wall
     """
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    # HEAD
+    final_url = job_url
+    last_response = None
+
     try:
-        r = SESSION.head(url, headers=headers, allow_redirects=True, timeout=CHECK_TIMEOUT)
-        code = r.status_code
-        r.close()
+        # Navigate to the job URL and capture the HTTP response
+        response = pw_page.goto(job_url, wait_until="domcontentloaded", timeout=CHECK_TIMEOUT * 1000)
+        if response:
+            last_response = response
+            if response.status in (404, 410):
+                return response.status, None, "Broken", pw_page.url
+
+        # Wait a moment for any JS popup to appear
+        pw_page.wait_for_timeout(POPUP_WAIT_MS)
+
+        # ----------------------------------------------------------------
+        # Detect and dismiss Getro popup
+        # Try to find and click "No thanks, take me to the application form"
+        # ----------------------------------------------------------------
+        popup_dismissed = _dismiss_getro_popup(pw_page)
+
+        if popup_dismissed:
+            # Wait for navigation to the real application page
+            try:
+                pw_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                pw_page.wait_for_timeout(2000)
+            except Exception:
+                pass
+            final_url = pw_page.url
+            print(f"    Popup dismissed → navigated to: {final_url}", flush=True)
+        else:
+            final_url = pw_page.url
+
+        # Check the current page status
+        code, err, result = _assess_current_page(pw_page, last_response)
+        return code, err, result, final_url
+
+    except PlaywrightTimeout:
+        return None, "playwright_timeout", "Broken", final_url
+    except Exception as e:
+        return None, type(e).__name__, "Broken", final_url
+
+
+def _dismiss_getro_popup(pw_page: Page) -> bool:
+    """
+    Try to find and click the 'No thanks' / skip link in the Getro popup.
+    Returns True if the popup was found and dismissed.
+    """
+    # First check if there's a popup/modal visible
+    popup_indicators = [
+        # Getro-specific
+        "text=You're about to go to",
+        "text=Before you go",
+        # Generic modal detection
+        "[role='dialog']",
+        ".modal",
+        "[class*='popup']",
+        "[class*='interstitial']",
+    ]
+
+    popup_visible = False
+    for indicator in popup_indicators:
+        try:
+            el = pw_page.locator(indicator).first
+            if el.is_visible(timeout=500):
+                popup_visible = True
+                break
+        except Exception:
+            continue
+
+    if not popup_visible:
+        # No popup detected
+        return False
+
+    print("    Getro popup detected, looking for skip link...", flush=True)
+
+    # Try clicking "No thanks, take me to the application form" (exact text match first)
+    for skip_text in SKIP_POPUP_TEXTS:
+        for loc_type in ["text", "partial text"]:
+            try:
+                if loc_type == "text":
+                    el = pw_page.get_by_text(skip_text, exact=False).first
+                else:
+                    el = pw_page.locator(f"a:has-text('{skip_text}')").first
+
+                if el.is_visible(timeout=500):
+                    el.click(timeout=3000)
+                    print(f"    Clicked: '{skip_text}'", flush=True)
+                    return True
+            except Exception:
+                continue
+
+    # Fallback: look for any external link icon (↗) next to "application form"
+    try:
+        # Getro uses an SVG external link icon next to the "take me to the application form" text
+        links = pw_page.locator("a").all()
+        for link in links[:30]:
+            try:
+                txt = (link.inner_text() or "").lower().strip()
+                if "application form" in txt or "no thanks" in txt or "directly" in txt:
+                    if link.is_visible(timeout=300):
+                        link.click(timeout=3000)
+                        print(f"    Clicked fallback link: '{txt[:60]}'", flush=True)
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Last resort: press Escape to close modal
+    try:
+        pw_page.keyboard.press("Escape")
+        pw_page.wait_for_timeout(500)
+        print("    Pressed Escape to close popup", flush=True)
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _assess_current_page(pw_page: Page, last_response) -> Tuple[Optional[int], Optional[str], str]:
+    """
+    Assess whether the current page loaded successfully.
+    """
+    current_url = pw_page.url
+
+    # If we navigated to a known 404/error page
+    if any(kw in current_url.lower() for kw in ["404", "not-found", "error", "expired"]):
+        return 404, "url_contains_error_keyword", "Broken"
+
+    # Check page title for error signals
+    try:
+        title = (pw_page.title() or "").lower()
+        if any(kw in title for kw in ["404", "not found", "page not found", "error", "expired", "closed"]):
+            return 404, f"page_title_contains: {title[:80]}", "Broken"
+    except Exception:
+        pass
+
+    # Check if we're on a meaningful page (has some content)
+    try:
+        body_text = pw_page.locator("body").inner_text(timeout=3000)
+        if len(body_text.strip()) < 50:
+            return None, "page_almost_empty", "Broken"
+    except Exception:
+        pass
+
+    # Use last captured HTTP response code
+    if last_response:
+        code = last_response.status
         if 200 <= code < 400:
             return code, None, "Active"
         if code in (404, 410):
             return code, None, "Broken"
-        if code in (401, 403, 429, 999):
-            return code, None, "Blocked"
-    except requests.RequestException as e:
-        pass  # fall through to GET
-
-    # GET (some servers don't support HEAD)
-    try:
-        r = SESSION.get(url, headers=headers, allow_redirects=True, timeout=CHECK_TIMEOUT, stream=True)
-        code = r.status_code
-        r.close()
-        if 200 <= code < 400:
-            return code, None, "Active"
-        if code in (404, 410):
-            return code, None, "Broken"
-        if code in (401, 403, 429, 999):
+        if code in (401, 403):
             return code, None, "Blocked"
         if code >= 500:
             return code, f"server_error_{code}", "Broken"
-        return code, f"unexpected_{code}", "Broken"
-    except requests.ConnectionError as e:
-        return None, f"ConnectionError: {str(e)[:100]}", "Broken"
-    except requests.Timeout:
-        return None, "Timeout", "Broken"
-    except requests.RequestException as e:
-        return None, type(e).__name__, "Broken"
 
-
-# =============================================================================
-# Playwright check for Blocked jobs (anti-bot)
-# =============================================================================
-
-
-def check_job_playwright(pw_page, url: str) -> Tuple[Optional[int], Optional[str], str]:
-    """Use real browser for jobs blocked by anti-bot."""
-    try:
-        response = pw_page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        if response:
-            code = response.status
-            if 200 <= code < 400:
-                return code, None, "Active"
-            if code in (404, 410):
-                return code, None, "Broken"
-            return code, f"http_{code}", "Blocked"
-        return None, "no_response", "Broken"
-    except PlaywrightTimeout:
-        return None, "playwright_timeout", "Broken"
-    except Exception as e:
-        return None, type(e).__name__, "Broken"
+    # Default: page loaded, assume Active
+    return 200, None, "Active"
 
 
 # =============================================================================
@@ -314,7 +400,7 @@ def check_job_playwright(pw_page, url: str) -> Tuple[Optional[int], Optional[str
 _last_notion_call = 0.0
 
 
-def _notion_headers() -> Dict[str, str]:
+def _notion_headers() -> Dict:
     return {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": NOTION_VERSION,
@@ -324,8 +410,7 @@ def _notion_headers() -> Dict[str, str]:
 
 def _notion_request(method: str, path: str, payload=None) -> Dict:
     global _last_notion_call
-    now = time.time()
-    delta = now - _last_notion_call
+    delta = time.time() - _last_notion_call
     if delta < 0.5:
         time.sleep(0.5 - delta)
     _last_notion_call = time.time()
@@ -342,7 +427,7 @@ def _notion_request(method: str, path: str, payload=None) -> Dict:
                 r = SESSION.get(url, headers=headers, timeout=15)
             else:
                 raise ValueError(f"Unknown method: {method}")
-        except requests.RequestException as e:
+        except requests.RequestException:
             if attempt < 4:
                 time.sleep(2 ** attempt)
                 continue
@@ -355,34 +440,34 @@ def _notion_request(method: str, path: str, payload=None) -> Dict:
             continue
         r.raise_for_status()
         return r.json()
-    raise RuntimeError(f"Notion {method} {path} failed")
+    raise RuntimeError(f"Notion {method} {path} failed after 4 attempts")
 
 
-def _set_rich_text(v: str) -> Dict:
+def _rt(v: str) -> Dict:
     v = (v or "")[:2000]
     return {"rich_text": [{"type": "text", "text": {"content": v}}]} if v else {"rich_text": []}
 
 
-def _set_title(v: str) -> Dict:
+def _title_prop(v: str) -> Dict:
     v = (v or "")[:2000]
     return {"title": [{"type": "text", "text": {"content": v}}]} if v else {"title": []}
 
 
-def _set_select(v: str) -> Dict:
+def _select(v: str) -> Dict:
     v = (v or "").strip()
     return {"select": {"name": v}} if v else {"select": None}
 
 
-def _set_url(v: Optional[str]) -> Dict:
+def _url_prop(v: Optional[str]) -> Dict:
     vv = (v or "").strip()
     return {"url": vv if vv else None}
 
 
-def _set_date(s: str) -> Dict:
+def _date_prop(s: str) -> Dict:
     return {"date": {"start": s}}
 
 
-def _set_number(n: Optional[int]) -> Dict:
+def _number(n: Optional[int]) -> Dict:
     return {"number": n if n is not None else None}
 
 
@@ -402,29 +487,6 @@ def _query_db(db_id: str) -> List[Dict]:
     return results
 
 
-def _get_rich_text(props: Dict, name: str) -> str:
-    try:
-        arr = props[name]["rich_text"]
-        return "".join(x.get("plain_text", "") for x in arr).strip() if arr else ""
-    except Exception:
-        return ""
-
-
-def _get_select(props: Dict, name: str) -> str:
-    try:
-        sel = props[name].get("select")
-        return (sel.get("name") or "").strip() if sel else ""
-    except Exception:
-        return ""
-
-
-def _get_url_prop(props: Dict, name: str) -> str:
-    try:
-        return (props[name].get("url") or "").strip()
-    except Exception:
-        return ""
-
-
 def upsert_notion_job(
     db_id: str,
     job_url: str,
@@ -433,11 +495,14 @@ def upsert_notion_job(
     result: str,
     http_code: Optional[int],
     error: str,
+    final_url: str,
 ) -> bool:
     """
-    Upsert a job entry in Notion. Returns True if this is a newly broken job.
-    The Notion DB should have: Name (title), URL (url), Status (select),
-    Department (rich_text), HTTP Code (number), Error (rich_text), Last Checked (date).
+    Upsert job status in Notion.
+    DB expected columns: Name (title), URL (url), Status (select),
+    Department (rich_text), HTTP Code (number), Error (rich_text),
+    Final URL (url), Last Checked (date).
+    Returns True if this is a newly broken job.
     """
     try:
         schema = _notion_request("GET", f"/databases/{db_id}")
@@ -445,40 +510,48 @@ def upsert_notion_job(
         print(f"[NOTION] Cannot read DB schema: {e}", flush=True)
         return False
 
-    # Find title property
-    title_prop = "Name"
+    title_prop_name = "Name"
     for k, v in schema.get("properties", {}).items():
         if v.get("type") == "title":
-            title_prop = k
+            title_prop_name = k
             break
 
     key = sha1(job_url)
     rows = _query_db(db_id)
-    existing_page = None
+    existing = None
     old_result = ""
     for row in rows:
         props = row.get("properties", {})
-        u = _get_url_prop(props, "URL")
+        u = ""
+        try:
+            u = (props.get("URL", {}).get("url") or "").strip()
+        except Exception:
+            pass
         if u and sha1(u) == key:
-            existing_page = row
-            old_result = _get_select(props, "Status")
+            existing = row
+            try:
+                sel = props.get("Status", {}).get("select")
+                old_result = (sel.get("name") or "").strip() if sel else ""
+            except Exception:
+                pass
             break
 
     props_payload = {
-        title_prop: _set_title(job_title or job_url),
-        "URL": _set_url(job_url),
-        "Status": _set_select(result),
-        "Department": _set_rich_text(department),
-        "HTTP Code": _set_number(http_code),
-        "Error": _set_rich_text(error),
-        "Last Checked": _set_date(iso_now()),
+        title_prop_name: _title_prop(job_title or job_url),
+        "URL": _url_prop(job_url),
+        "Status": _select(result),
+        "Department": _rt(department),
+        "HTTP Code": _number(http_code),
+        "Error": _rt(error),
+        "Final URL": _url_prop(final_url if final_url != job_url else ""),
+        "Last Checked": _date_prop(iso_now()),
     }
 
     newly_broken = False
-    if existing_page:
+    if existing:
         if old_result != "Broken" and result == "Broken":
             newly_broken = True
-        _notion_request("PATCH", f"/pages/{existing_page['id']}", {"properties": props_payload})
+        _notion_request("PATCH", f"/pages/{existing['id']}", {"properties": props_payload})
     else:
         _notion_request("POST", "/pages", {
             "parent": {"database_id": db_id},
@@ -497,6 +570,7 @@ def upsert_notion_job(
 
 def main():
     print(f"[careers_checker] URL: {CAREERS_URL}", flush=True)
+    print(f"[careers_checker] Popup wait: {POPUP_WAIT_MS}ms | Page load wait: {JOBS_PAGE_LOAD_WAIT}ms", flush=True)
     print(f"[careers_checker] Notion tracking: {'enabled' if NOTION_CAREERS_DB_ID and NOTION_TOKEN else 'disabled'}", flush=True)
 
     with sync_playwright() as p:
@@ -506,74 +580,71 @@ def main():
             user_agent=USER_AGENT,
         )
         page = context.new_page()
-        check_page = context.new_page()
 
         # ----------------------------------------------------------------
-        # Step 1: load careers page and extract job listings
+        # Step 1: load careers listing page
         # ----------------------------------------------------------------
-        print(f"[careers_checker] Loading {CAREERS_URL}...", flush=True)
+        print(f"[careers_checker] Loading jobs listing page...", flush=True)
         try:
             page.goto(CAREERS_URL, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(JOBS_PAGE_LOAD_WAIT)  # let JS render jobs
-            page_title = page.title() or CAREERS_URL
+            page.wait_for_timeout(JOBS_PAGE_LOAD_WAIT)
         except PlaywrightTimeout:
-            print("[careers_checker] Timeout loading careers page", flush=True)
             slack_notify(f"⚠️ *Careers Checker*: timeout loading <{CAREERS_URL}|careers page>")
             browser.close()
             return
         except Exception as e:
-            print(f"[careers_checker] Error loading careers page: {e}", flush=True)
             slack_notify(f"⚠️ *Careers Checker*: error loading <{CAREERS_URL}|careers page> — `{e}`")
             browser.close()
             return
 
-        jobs = extract_job_links_playwright(page, CAREERS_URL)
-        print(f"[careers_checker] Found {len(jobs)} job listings", flush=True)
+        jobs = extract_job_listings(page, CAREERS_URL)
+        print(f"[careers_checker] Found {len(jobs)} job listings:", flush=True)
         for j in jobs:
-            print(f"  • {j['title']} [{j.get('department','—')}] → {j['url']}", flush=True)
+            print(f"  • [{j.get('department','—'):20s}] {j['title']} → {j['url']}", flush=True)
 
         if not jobs:
             msg = (
                 f"⚠️ *Careers Checker*: no job listings found on <{CAREERS_URL}|careers page>.\n"
-                "This may mean the page is empty, the selectors don't match the platform, "
-                "or the page didn't render in time."
+                "The page may be empty, or the selectors don't match the platform yet."
             )
-            print("[careers_checker] No jobs found — sending alert", flush=True)
             slack_notify(msg)
             browser.close()
             return
 
         # ----------------------------------------------------------------
-        # Step 2: check each job URL
+        # Step 2: check each job (navigate → dismiss Getro popup → verify)
         # ----------------------------------------------------------------
         results: List[Dict] = []
-        broken_jobs: List[Dict] = []
         newly_broken_jobs: List[Dict] = []
 
         for job in jobs:
             url = job["url"]
-            print(f"[careers_checker] Checking: {url}", flush=True)
+            print(f"\n[careers_checker] Checking: {job['title']}", flush=True)
+            print(f"  URL: {url}", flush=True)
 
-            code, err, result = check_job_url(url)
-
-            # For Blocked → try Playwright (anti-bot sites)
-            if result == "Blocked":
-                print(f"  → Blocked via HTTP, trying Playwright...", flush=True)
-                code, err, result = check_job_playwright(check_page, url)
+            # Each job gets its own page context to avoid state leaking between checks
+            job_page = context.new_page()
+            try:
+                code, err, result, final_url = check_job_with_playwright(job_page, url)
+            finally:
+                try:
+                    job_page.close()
+                except Exception:
+                    pass
 
             job_data = {
                 "title": job["title"],
                 "url": url,
+                "final_url": final_url,
                 "department": job.get("department", ""),
                 "result": result,
                 "http_code": code,
                 "error": err or "",
             }
             results.append(job_data)
-            print(f"  → {result} ({code})", flush=True)
 
-            if result == "Broken":
-                broken_jobs.append(job_data)
+            status_icon = "✅" if result == "Active" else ("⚠️" if result == "Blocked" else "❌")
+            print(f"  {status_icon} Result: {result} (HTTP {code}) → {final_url}", flush=True)
 
             # Write to Notion if configured
             if NOTION_CAREERS_DB_ID and NOTION_TOKEN:
@@ -586,13 +657,16 @@ def main():
                         result=result,
                         http_code=code,
                         error=err or "",
+                        final_url=final_url,
                     )
                     if is_new_broken:
                         newly_broken_jobs.append(job_data)
                 except Exception as e:
                     print(f"  [NOTION ERROR] {e}", flush=True)
+                    if result == "Broken":
+                        newly_broken_jobs.append(job_data)
             else:
-                # Without Notion we can't track history, treat all broken as "newly broken"
+                # Without Notion history, flag all broken as newly broken
                 if result == "Broken":
                     newly_broken_jobs.append(job_data)
 
@@ -607,27 +681,35 @@ def main():
         blocked = sum(1 for r in results if r["result"] == "Blocked")
 
         print(
-            f"\n[careers_checker] Summary: {total} jobs | {active} active | {broken} broken | {blocked} blocked",
+            f"\n[careers_checker] ── Summary ──────────────────────────────",
             flush=True,
         )
+        print(f"  Total: {total} | Active: {active} | Broken: {broken} | Blocked: {blocked}", flush=True)
+        for r in results:
+            icon = "✅" if r["result"] == "Active" else ("⚠️" if r["result"] == "Blocked" else "❌")
+            print(f"  {icon} {r['title']} → {r['result']}", flush=True)
 
         if newly_broken_jobs:
-            lines = [f"🚨 *Careers Checker*: {len(newly_broken_jobs)} job posting(s) are now broken:"]
+            lines = [f"🚨 *Careers Checker*: {len(newly_broken_jobs)} job posting(s) have a broken application form:"]
             for j in newly_broken_jobs:
-                dept_str = f" [{j['department']}]" if j.get("department") else ""
-                lines.append(f"  • <{j['url']}|{j['title']}>{dept_str} → {j['result']} ({j['http_code'] or 'no response'})")
-            lines.append(f"\n_Open positions page: <{CAREERS_URL}|careers.marble.studio/jobs>_")
+                dept = f" [{j['department']}]" if j.get("department") else ""
+                lines.append(
+                    f"  • <{j['url']}|{j['title']}>{dept}\n"
+                    f"    ↳ Result: *{j['result']}* (HTTP {j['http_code'] or 'no response'})"
+                    + (f"\n    ↳ Final URL: `{j['final_url']}`" if j['final_url'] != j['url'] else "")
+                )
+            lines.append(f"\n_<{CAREERS_URL}|View open positions at Marble>_")
             slack_notify("\n".join(lines))
 
         elif SLACK_ALWAYS_NOTIFY:
-            lines = [f"✅ *Careers Checker*: {active}/{total} job postings are active"]
+            lines = [f"✅ *Careers Checker*: {active}/{total} job postings have a working application form"]
             if blocked:
-                lines.append(f"  ⚠️ {blocked} job(s) could not be verified (blocked by anti-bot)")
+                lines.append(f"  ⚠️ {blocked} job(s) could not be fully verified (anti-bot)")
             lines.append(f"_<{CAREERS_URL}|careers.marble.studio/jobs>_")
             slack_notify("\n".join(lines))
 
-        elif broken == 0:
-            print(f"[careers_checker] All {total} jobs OK — no Slack alert (set SLACK_ALWAYS_NOTIFY=true to always notify)", flush=True)
+        else:
+            print("[careers_checker] All OK — no Slack alert (SLACK_ALWAYS_NOTIFY=true to always notify)", flush=True)
 
         print("[careers_checker] Done.", flush=True)
 
