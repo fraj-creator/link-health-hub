@@ -28,6 +28,7 @@ ENV vars:
 """
 
 import os
+import signal
 import time
 import hashlib
 from datetime import datetime, timezone
@@ -142,7 +143,7 @@ def extract_job_listings(page: Page, careers_url: str) -> List[Dict[str, str]]:
             for i in range(min(count, 300)):
                 try:
                     el = els.nth(i)
-                    href = el.get_attribute("href") or ""
+                    href = el.get_attribute("href", timeout=1000) or ""
                     if not href or href.startswith(("mailto:", "tel:", "#", "javascript:")):
                         continue
                     abs_url = normalize_url(careers_url, href)
@@ -181,13 +182,13 @@ def _is_known_job_platform(url: str) -> bool:
 def _extract_title(el) -> str:
     for sel in ["h2", "h3", "h4", ".title", ".job-title", "[class*='title']", "strong"]:
         try:
-            t = el.locator(sel).first.inner_text().strip()
+            t = el.locator(sel).first.inner_text(timeout=1000).strip()
             if t and len(t) > 2:
                 return t[:200]
         except Exception:
             pass
     try:
-        t = el.inner_text().strip()
+        t = el.inner_text(timeout=1000).strip()
         return t[:200] if t else "Unknown Position"
     except Exception:
         return "Unknown Position"
@@ -196,7 +197,7 @@ def _extract_title(el) -> str:
 def _extract_department(el) -> str:
     for sel in [".department", ".team", ".category", "[class*='department']", "span"]:
         try:
-            t = el.locator(sel).first.inner_text().strip()
+            t = el.locator(sel).first.inner_text(timeout=1000).strip()
             if t and 1 < len(t) < 60:
                 return t
         except Exception:
@@ -328,7 +329,7 @@ def _dismiss_getro_popup(pw_page: Page) -> bool:
         links = pw_page.locator("a").all()
         for link in links[:30]:
             try:
-                txt = (link.inner_text() or "").lower().strip()
+                txt = (link.inner_text(timeout=1000) or "").lower().strip()
                 if "application form" in txt or "no thanks" in txt or "directly" in txt:
                     if link.is_visible(timeout=300):
                         link.click(timeout=3000)
@@ -715,4 +716,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # Hard kill after 10 minutes to prevent CI jobs hanging indefinitely
+    def _timeout_handler(signum, frame):
+        print("[careers_checker] FATAL: global timeout (10m) exceeded, aborting.", flush=True)
+        raise SystemExit(1)
+
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(600)  # 10 minutes
+
     main()
