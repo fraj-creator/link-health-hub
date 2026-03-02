@@ -88,5 +88,10 @@ jobs:
           SKIP_DOMAINS: "linkedin.com"
           EXCLUDE_DOM_AREAS: "Footer,Nav"
 
+          # Extra starting URLs crawled alongside SITE_BASE_URL.
+          # careers.marble.studio is treated as internal (same marble.studio domain).
+          # Job links discovered via Getro popup are checked as external links.
+          EXTRA_SEED_URLS: "https://careers.marble.studio/jobs"
+
         run: |
           python bfs_crawl_360_to_notion.py

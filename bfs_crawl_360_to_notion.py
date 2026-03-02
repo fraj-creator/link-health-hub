@@ -60,6 +60,8 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"].strip()
 DB_A_ID = os.environ["NOTION_DB_A_ID"].strip()
 DB_B_ID = os.environ["NOTION_DB_B_ID"].strip()
 SITE_BASE_URL = os.environ["SITE_BASE_URL"].strip()
+# Extra seed URLs crawled alongside SITE_BASE_URL (comma-separated, same domain check applies)
+EXTRA_SEED_URLS = [u.strip() for u in os.environ.get("EXTRA_SEED_URLS", "").split(",") if u.strip()]
 
 LIMIT_MODE = os.environ.get("LIMIT_MODE", "pages").strip().lower()  # pages|total
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "120"))
@@ -858,13 +860,100 @@ def check_page_alive(url: str) -> Tuple[bool, Optional[int], Optional[str]]:
 # Playwright extraction
 # =============================================================================
 
+# Text variants of the Getro "skip popup" link (case-insensitive match)
+_GETRO_SKIP_TEXTS = [
+    "no thanks, take me to the application form",
+    "take me to the application form",
+    "no thanks",
+    "go directly to",
+    "skip",
+]
+
+
+def _extract_getro_application_url(page) -> Optional[str]:
+    """
+    Detect the Getro interstitial popup ("You're about to go to X's website")
+    and return the href of the 'No thanks, take me to the application form' link.
+    Returns None if no popup is present.
+
+    This runs BEFORE the normal link extraction so BFS can check the real
+    application form URL as an external link — exactly as a human would.
+    """
+    # Quick popup detection — bail fast if not a Getro page
+    try:
+        popup_present = False
+        for indicator in ["text=You're about to go to", "text=Before you go", "[role='dialog']"]:
+            try:
+                if page.locator(indicator).first.is_visible(timeout=600):
+                    popup_present = True
+                    break
+            except Exception:
+                continue
+        if not popup_present:
+            return None
+    except Exception:
+        return None
+
+    print("  [Getro popup] detected — extracting application form URL", flush=True)
+
+    # Look for "No thanks" / skip link by text
+    for skip_text in _GETRO_SKIP_TEXTS:
+        for locator in [
+            page.get_by_text(skip_text, exact=False),
+            page.locator(f"a:has-text('{skip_text}')"),
+        ]:
+            try:
+                el = locator.first
+                if el.is_visible(timeout=400):
+                    href = el.get_attribute("href") or ""
+                    if href and href.startswith("http"):
+                        print(f"  [Getro popup] application URL: {href}", flush=True)
+                        return href
+            except Exception:
+                continue
+
+    # Fallback: any visible <a> whose text contains "application form" or "no thanks"
+    try:
+        for link in page.locator("a[href]").all()[:40]:
+            try:
+                txt = (link.inner_text() or "").lower().strip()
+                href = link.get_attribute("href") or ""
+                if href.startswith("http") and ("application form" in txt or "no thanks" in txt):
+                    print(f"  [Getro popup] fallback application URL: {href}", flush=True)
+                    return href
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None
+
+
+def _close_getro_popup(page) -> None:
+    """Close the Getro popup (Escape key) so normal link extraction can proceed."""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
 def extract_links_playwright(page) -> List[Dict[str, str]]:
     """
-    FIX: deduplicate links between first pass (Main) and second pass (Accordion).
-    Second pass only appends hrefs that were not already seen in the first pass.
+    Extracts all links from the rendered page.
+    - Detects Getro interstitial popup: extracts the real application form URL
+      and adds it as an explicit link before closing the popup.
+    - FIX: deduplicates between Main pass and Accordion pass.
     """
     items: List[Dict[str, str]] = []
     seen_hrefs: Set[str] = set()
+
+    # Getro popup check: if present, extract the application URL first
+    app_url = _extract_getro_application_url(page)
+    if app_url:
+        items.append({"href": app_url, "anchor_text": "Job Application Form", "dom_area": "Main"})
+        seen_hrefs.add(app_url)
+        _close_getro_popup(page)
 
     # First pass — links visible without clicking
     anchors = page.locator("a[href]")
@@ -935,6 +1024,14 @@ def main():
     queue = deque([base])
     parent: Dict[str, Optional[str]] = {base: None}
     seen: Set[str] = set()
+
+    # Add extra seed URLs (e.g. careers.marble.studio/jobs) to the BFS queue
+    for extra_url in EXTRA_SEED_URLS:
+        extra_url = strip_trailing_slash(drop_query(extra_url))
+        if extra_url and extra_url not in parent:
+            queue.append(extra_url)
+            parent[extra_url] = None
+            print(f"Extra seed URL added: {extra_url}", flush=True)
 
     pages_crawled = 0
     total_checks = 0
